@@ -12,10 +12,20 @@ if TYPE_CHECKING:
     from app.models.project import Project
 
 # All possible stem names produced by the engine
-STEM_NAMES = frozenset({
-    "vocals", "drums", "kick", "snare", "hihats",
-    "bass", "guitar", "piano", "other", "original",
-})
+STEM_NAMES = frozenset(
+    {
+        "vocals",
+        "drums",
+        "kick",
+        "snare",
+        "hihats",
+        "bass",
+        "guitar",
+        "piano",
+        "other",
+        "original",
+    }
+)
 
 
 class OutputFile(Base, TimestampMixin):
@@ -23,7 +33,10 @@ class OutputFile(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
     project_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     job_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("processing_jobs.id", ondelete="CASCADE"), nullable=False

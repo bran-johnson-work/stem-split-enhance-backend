@@ -15,12 +15,18 @@ class Plan(Base, TimestampMixin):
     __tablename__ = "plans"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
-    name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)  # free | starter | pro
+    name: Mapped[str] = mapped_column(
+        String(50), unique=True, nullable=False
+    )  # free | starter | pro
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
     price_monthly_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    max_projects_per_month: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None = unlimited
+    max_projects_per_month: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # None = unlimited
     max_file_size_mb: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     stripe_price_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    subscriptions: Mapped[list["Subscription"]] = relationship("Subscription", back_populates="plan")
+    subscriptions: Mapped[list["Subscription"]] = relationship(
+        "Subscription", back_populates="plan"
+    )

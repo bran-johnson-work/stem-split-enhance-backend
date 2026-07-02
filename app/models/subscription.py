@@ -37,9 +37,15 @@ class Subscription(Base, TimestampMixin):
         Enum(SubscriptionStatus), default=SubscriptionStatus.ACTIVE, nullable=False
     )
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    current_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    current_period_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="subscription")

@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Pooled URL for the app via PgBouncer (port 6543)
     database_url_pooled: str = ""
 
+    # JWT Authentication
+    secret_key: str = "your-super-secret-key-change-in-production"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
