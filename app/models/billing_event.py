@@ -6,10 +6,10 @@ from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.user import User
+    from app.models.user import User
 
 
 class BillingEvent(Base, TimestampMixin):

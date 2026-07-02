@@ -7,11 +7,11 @@ from sqlalchemy import DateTime, Enum, Float, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.output_file import OutputFile
-    from models.project import Project
+    from app.models.output_file import OutputFile
+    from app.models.project import Project
 
 
 class JobStatus(str, enum.Enum):

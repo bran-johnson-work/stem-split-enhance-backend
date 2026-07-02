@@ -7,11 +7,11 @@ from sqlalchemy import DateTime, Enum, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.plan import Plan
-    from models.user import User
+    from app.models.plan import Plan
+    from app.models.user import User
 
 
 class SubscriptionStatus(str, enum.Enum):
