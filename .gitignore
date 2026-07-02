@@ -39,3 +39,5 @@ coverage.xml
 
 # Legacy stem engine (pending migration to root)
 stem-engine/
+.env
+.agents/

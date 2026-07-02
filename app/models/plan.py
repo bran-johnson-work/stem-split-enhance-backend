@@ -5,10 +5,10 @@ from sqlalchemy import Boolean, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.subscription import Subscription
+    from app.models.subscription import Subscription
 
 
 class Plan(Base, TimestampMixin):
