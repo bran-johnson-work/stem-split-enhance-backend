@@ -5,10 +5,10 @@ from sqlalchemy import BigInteger, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.project import Project
+    from app.models.project import Project
 
 
 class ProjectFile(Base, TimestampMixin):

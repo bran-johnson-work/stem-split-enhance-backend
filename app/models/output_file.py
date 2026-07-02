@@ -5,11 +5,11 @@ from sqlalchemy import BigInteger, Boolean, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.processing_job import ProcessingJob
-    from models.project import Project
+    from app.models.processing_job import ProcessingJob
+    from app.models.project import Project
 
 # All possible stem names produced by the engine
 STEM_NAMES = frozenset({

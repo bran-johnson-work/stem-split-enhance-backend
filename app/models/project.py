@@ -6,13 +6,13 @@ from sqlalchemy import Enum, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from models.base import Base, TimestampMixin, new_uuid
+from app.models.base import Base, TimestampMixin, new_uuid
 
 if TYPE_CHECKING:
-    from models.output_file import OutputFile
-    from models.processing_job import ProcessingJob
-    from models.project_file import ProjectFile
-    from models.user import User
+    from app.models.output_file import OutputFile
+    from app.models.processing_job import ProcessingJob
+    from app.models.project_file import ProjectFile
+    from app.models.user import User
 
 
 class ProjectStatus(str, enum.Enum):
