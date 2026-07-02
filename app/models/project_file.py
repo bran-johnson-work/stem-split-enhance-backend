@@ -18,7 +18,10 @@ class ProjectFile(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
     project_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), unique=True, nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
     )
     original_filename: Mapped[str] = mapped_column(String(500), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(1000), nullable=False)  # S3 object key

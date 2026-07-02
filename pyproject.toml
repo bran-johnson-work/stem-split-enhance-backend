@@ -15,12 +15,18 @@ package-mode = false
 
 [tool.poetry.group.dev.dependencies]
 ruff = ">=0.15,<0.16"
+pytest = ">=8.0"
+pytest-asyncio = ">=0.24"
 
 [tool.ruff]
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

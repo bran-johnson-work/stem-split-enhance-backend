@@ -16,12 +16,12 @@ if TYPE_CHECKING:
 
 
 class ProjectStatus(str, enum.Enum):
-    PENDING = "pending"        # created, no file yet
-    UPLOADING = "uploading"    # file upload in progress
-    QUEUED = "queued"          # file received, waiting for engine
+    PENDING = "pending"  # created, no file yet
+    UPLOADING = "uploading"  # file upload in progress
+    QUEUED = "queued"  # file received, waiting for engine
     PROCESSING = "processing"  # engine is working
-    COMPLETED = "completed"    # stems ready for download
-    FAILED = "failed"          # unrecoverable error
+    COMPLETED = "completed"  # stems ready for download
+    FAILED = "failed"  # unrecoverable error
 
 
 class Project(Base, TimestampMixin):
@@ -41,8 +41,10 @@ class Project(Base, TimestampMixin):
         "ProjectFile", back_populates="project", uselist=False, cascade="all, delete-orphan"
     )
     processing_jobs: Mapped[list["ProcessingJob"]] = relationship(
-        "ProcessingJob", back_populates="project", cascade="all, delete-orphan",
-        order_by="ProcessingJob.created_at"
+        "ProcessingJob",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProcessingJob.created_at",
     )
     output_files: Mapped[list["OutputFile"]] = relationship(
         "OutputFile", back_populates="project", cascade="all, delete-orphan"
