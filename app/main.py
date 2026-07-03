@@ -3,8 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 
 settings = get_settings()
+
+configure_logging(settings.log_level)
+# Refuse to boot with insecure config (e.g. missing SECRET_KEY) outside local.
+settings.assert_production_ready()
 
 app = FastAPI(
     title="AI Audio Stem API",

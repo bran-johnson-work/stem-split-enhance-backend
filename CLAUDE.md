@@ -32,7 +32,7 @@ alembic revision --autogenerate -m "description"
 alembic upgrade head
 ```
 
-Environment variables are loaded from `.env` (see `.env.example`). Key ones: `DATABASE_URL` (direct, port 5432 — used only by Alembic), `DATABASE_URL_POOLED` (PgBouncer, port 6543 — used by the app), `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` (storage), `SECRET_KEY` (JWT signing).
+Environment variables are loaded from `.env` (see `.env.example`). Key ones: `DATABASE_URL` (direct, port 5432 — used only by Alembic), `DATABASE_URL_POOLED` (PgBouncer, port 6543 — used by the app), `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` (storage), `SECRET_KEY` (JWT signing — **required in non-local envs; the app refuses to boot without it** via `Settings.assert_production_ready()` in `app/main.py`).
 
 ## Architecture
 
@@ -49,7 +49,8 @@ api/v1/endpoints/*.py  → services/*.py  → repositories/*.py  → models/*.py
 - **`app/services/`** — business logic (password hashing, uniqueness checks, orchestrating repo calls). Services own the `db.commit()` call; repositories only `flush()`/`refresh()`. Also exported as singletons (`user_service = UserService()`).
 - **`app/schemas/`** — Pydantic v2 models for API I/O (`*Create`, `*Update`, `*Response`, using `ConfigDict(from_attributes=True)` to serialize from ORM objects). Keep separate from `app/models/` (ORM) — never return ORM objects directly from an endpoint without a response_model schema.
 - **`app/api/v1/endpoints/`** — thin route handlers: validate via schema, call the service, translate `ValueError`/`None` into `HTTPException`. Registered onto `api_router` in `app/api/v1/router.py`, mounted at `/api/v1` in `app/main.py`.
-- **`app/api/dependencies.py`** — shared FastAPI dependencies, notably `get_current_user` (decodes the JWT bearer token via PyJWT, loads the user through `user_repository`).
+- **`app/api/dependencies.py`** — shared FastAPI dependencies. `get_token_payload` decodes + fully validates the JWT (signature, `exp`/`nbf`, `iss`, `aud`, required claims); `get_current_user` builds on it, rejects revoked tokens (logout denylist), and loads the user through `user_repository`.
+- **Auth security model** — JWTs carry a full claim set (`sub`/`iat`/`nbf`/`exp`/`jti`/`iss`/`aud`) created in `app/core/security.py`. Logout revokes a token by inserting its `jti` into the `revoked_tokens` table (`RevokedToken` model + `revoked_token_repository`, committed via `auth_service.logout`); `get_current_user` checks that denylist on every request. Login is throttled per client-IP+email by an in-process `SlidingWindowRateLimiter` (`app/core/rate_limit.py`) — swap for a shared store (Redis) for multi-instance. Login/register return generic messages (no account enumeration); the real reason is logged. Auth TTL, PBKDF2 iteration count, issuer/audience, and rate-limit thresholds are all `Settings`-driven.
 - **`app/core/`** — cross-cutting concerns: `config.py` (`pydantic-settings` `Settings`, cached via `get_settings()`), `database.py` (async engine + `get_db` session dependency, always using the *pooled* URL for the app), `security.py` (PBKDF2-HMAC-SHA256 password hashing + PyJWT token creation — not passlib/python-jose), `storage.py` (Supabase Storage client for the `audio-inputs` / `audio-stems` buckets).
 
 ### Conventions to follow when extending this codebase
