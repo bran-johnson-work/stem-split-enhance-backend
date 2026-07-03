@@ -20,6 +20,8 @@ pytest-asyncio = ">=0.24"
 
 [tool.ruff]
 line-length = 100
+# Auto-generated Alembic revisions follow Alembic's own formatting.
+extend-exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

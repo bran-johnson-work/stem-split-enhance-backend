@@ -1,4 +1,6 @@
-from app.core.config import Settings
+import pytest
+
+from app.core.config import INSECURE_DEFAULT_SECRET, Settings
 
 
 def test_is_local_is_case_insensitive():
@@ -33,3 +35,24 @@ def test_active_database_url_prefers_pooled():
 def test_active_database_url_falls_back_to_direct():
     settings = Settings(database_url="direct-url", database_url_pooled="")
     assert settings.active_database_url == "direct-url"
+
+
+def test_has_secure_secret():
+    assert Settings(secret_key="a-strong-random-value").has_secure_secret is True
+    assert Settings(secret_key="").has_secure_secret is False
+    assert Settings(secret_key=INSECURE_DEFAULT_SECRET).has_secure_secret is False
+
+
+def test_production_guard_raises_without_secret():
+    with pytest.raises(RuntimeError, match="SECRET_KEY"):
+        Settings(app_env="production", secret_key="").assert_production_ready()
+
+
+def test_production_guard_passes_with_secret():
+    # Should not raise.
+    Settings(app_env="production", secret_key="a-strong-random-value").assert_production_ready()
+
+
+def test_local_env_skips_production_guard():
+    # Even with no secret, local dev is allowed to boot.
+    Settings(app_env="local", secret_key="").assert_production_ready()
