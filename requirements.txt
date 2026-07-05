@@ -11,3 +11,6 @@ alembic>=1.13,<2.0
 
 # Supabase (storage + auth JWT verification)
 supabase>=2.0,<3.0
+
+# Async HTTP client (Resend transactional email API)
+httpx>=0.27,<0.29

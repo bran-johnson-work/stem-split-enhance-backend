@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "ai-audio-stem-api"
     jwt_audience: str = "ai-audio-stem-api-clients"
+    # Distinct audience for email-verification links so they can never be replayed
+    # as API access tokens (standard JWT audience validation rejects the mismatch).
+    jwt_email_verification_audience: str = "ai-audio-stem-api-email-verification"
     access_token_expire_minutes: int = 30
 
     # Password hashing (PBKDF2-HMAC-SHA256). OWASP-recommended floor is ~600k.
@@ -42,6 +45,22 @@ class Settings(BaseSettings):
         "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave,"
         "audio/flac,audio/x-flac,audio/mp4,audio/aac,audio/ogg,audio/webm"
     )
+
+    # Email (Resend transactional email API — https://resend.com).
+    # ``resend_api_key`` empty => email is disabled (sends become no-ops that log
+    # a warning), which keeps the test suite and local dev network-free.
+    resend_api_key: str = ""
+    resend_api_base_url: str = "https://api.resend.com"
+    # Sender identity. ``email_from`` must be an address on a domain verified in
+    # the Resend dashboard; "onboarding@resend.dev" is Resend's shared sandbox
+    # sender, usable without domain verification for first-run testing.
+    email_from: str = "onboarding@resend.dev"
+    email_from_name: str = "AI Audio Stem"
+    email_timeout_seconds: float = 10.0
+    # Base URL of the frontend that hosts the email-verification landing page.
+    frontend_url: str = "http://localhost:3000"
+    # How long an email-verification link stays valid.
+    email_verification_token_expire_hours: int = 24
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -65,6 +84,18 @@ class Settings(BaseSettings):
     def active_database_url(self) -> str:
         """App always uses the pooled connection; Alembic uses database_url directly."""
         return self.database_url_pooled or self.database_url
+
+    @property
+    def email_enabled(self) -> bool:
+        """Whether outbound email is configured (a Resend API key is present)."""
+        return bool(self.resend_api_key)
+
+    @property
+    def email_sender(self) -> str:
+        """Sender in the ``Name <address>`` form the Resend API expects."""
+        if self.email_from_name:
+            return f"{self.email_from_name} <{self.email_from}>"
+        return self.email_from
 
     def assert_production_ready(self) -> None:
         """Fail fast on insecure configuration outside local development.
