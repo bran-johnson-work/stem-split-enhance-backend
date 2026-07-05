@@ -98,6 +98,93 @@ async def test_rejects_file_over_limit(service, fake_db, monkeypatch):
     service.repository.create.assert_not_called()
 
 
+async def test_create_upload_url_success(service, fake_db, monkeypatch):
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    service.repository.create.return_value = project
+
+    signed_mock = MagicMock(return_value={"url": "https://up.example", "token": "tok", "path": "p"})
+    monkeypatch.setattr(
+        project_service_module.storage, "create_signed_upload_url", signed_mock
+    )
+
+    result_project, signed = await service.create_upload_url(
+        fake_db,
+        user_id=user_id,
+        name="Song",
+        filename="song.wav",
+        content_type="audio/wav",
+    )
+
+    assert result_project is project
+    assert signed["storage_key"] == f"{user_id}/{project.id}/song.wav"
+    assert signed["url"] == "https://up.example"
+    assert signed["token"] == "tok"
+    # The signed URL is scoped to the user/project-namespaced key.
+    assert signed_mock.call_args.args[1] == f"{user_id}/{project.id}/song.wav"
+    fake_db.commit.assert_awaited_once()
+
+
+async def test_create_upload_url_rejects_bad_type(service, fake_db):
+    with pytest.raises(ValueError, match="Unsupported audio content type"):
+        await service.create_upload_url(
+            fake_db,
+            user_id=uuid.uuid4(),
+            name="Song",
+            filename="x.zip",
+            content_type="application/zip",
+        )
+    service.repository.create.assert_not_called()
+
+
+async def test_complete_upload_records_stored_file(service, fake_db, monkeypatch):
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    project.input_file = None
+    service.repository.get_for_user.return_value = project
+    service.repository.update.return_value = project
+
+    list_mock = MagicMock(
+        return_value=[{"name": "song.wav", "metadata": {"size": 2048, "mimetype": "audio/wav"}}]
+    )
+    monkeypatch.setattr(project_service_module.storage, "list_objects", list_mock)
+
+    result = await service.complete_upload(fake_db, project_id=project.id, user_id=user_id)
+
+    assert result is project
+    service.file_repository.create_for_project.assert_awaited_once()
+    kwargs = service.file_repository.create_for_project.call_args.kwargs
+    assert kwargs["storage_key"] == f"{user_id}/{project.id}/song.wav"
+    assert kwargs["file_size_bytes"] == 2048
+    assert kwargs["content_type"] == "audio/wav"
+    assert service.repository.update.call_args.args[2] == {"status": ProjectStatus.QUEUED}
+    fake_db.commit.assert_awaited_once()
+
+
+async def test_complete_upload_missing_project_returns_none(service, fake_db):
+    service.repository.get_for_user.return_value = None
+    result = await service.complete_upload(
+        fake_db, project_id=uuid.uuid4(), user_id=uuid.uuid4()
+    )
+    assert result is None
+    service.file_repository.create_for_project.assert_not_called()
+
+
+async def test_complete_upload_no_object_raises(service, fake_db, monkeypatch):
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    project.input_file = None
+    service.repository.get_for_user.return_value = project
+
+    monkeypatch.setattr(
+        project_service_module.storage, "list_objects", MagicMock(return_value=[])
+    )
+
+    with pytest.raises(ValueError, match="No uploaded file found"):
+        await service.complete_upload(fake_db, project_id=project.id, user_id=user_id)
+    service.file_repository.create_for_project.assert_not_called()
+
+
 async def test_cleans_up_storage_on_db_failure(service, fake_db, monkeypatch):
     user_id = uuid.uuid4()
     project = _project(user_id)
