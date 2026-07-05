@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     login_rate_limit_max_attempts: int = 5
     login_rate_limit_window_seconds: int = 300
 
+    # Audio uploads. 50 MB matches the Supabase Free-plan global upload ceiling;
+    # raise this (and the project's Storage limit) on a paid plan if needed.
+    max_upload_size_bytes: int = 50 * 1024 * 1024  # 50 MB
+    allowed_audio_content_types: str = (
+        "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave,"
+        "audio/flac,audio/x-flac,audio/mp4,audio/aac,audio/ogg,audio/webm"
+    )
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -48,6 +56,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def allowed_audio_content_type_set(self) -> set[str]:
+        return {t.strip().lower() for t in self.allowed_audio_content_types.split(",") if t.strip()}
 
     @property
     def active_database_url(self) -> str:
