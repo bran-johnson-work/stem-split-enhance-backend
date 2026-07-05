@@ -94,3 +94,48 @@ def test_expire_minutes_is_config_driven():
     payload = security.decode_access_token(security.create_access_token({"sub": "x"}))
     span_minutes = (payload["exp"] - payload["iat"]) / 60
     assert round(span_minutes) == settings.access_token_expire_minutes
+
+
+# --- Email verification tokens ------------------------------------------------
+
+
+def test_email_verification_token_has_expiry_and_claims():
+    settings = get_settings()
+    token = security.create_email_verification_token("user-1", "u@example.com")
+    payload = security.decode_email_verification_token(token)
+    assert payload["sub"] == "user-1"
+    assert payload["email"] == "u@example.com"
+    assert payload["purpose"] == security.EMAIL_VERIFICATION_PURPOSE
+    assert payload["aud"] == settings.jwt_email_verification_audience
+    for claim in ("iat", "nbf", "exp", "jti"):
+        assert claim in payload
+
+
+def test_email_verification_token_expiry_is_config_driven():
+    settings = get_settings()
+    payload = security.decode_email_verification_token(
+        security.create_email_verification_token("x", "u@example.com")
+    )
+    span_hours = (payload["exp"] - payload["iat"]) / 3600
+    assert round(span_hours) == settings.email_verification_token_expire_hours
+
+
+def test_expired_email_verification_token_is_rejected(monkeypatch):
+    monkeypatch.setattr(security.settings, "email_verification_token_expire_hours", -1)
+    token = security.create_email_verification_token("x", "u@example.com")
+    with pytest.raises(jwt.ExpiredSignatureError):
+        security.decode_email_verification_token(token)
+
+
+def test_verification_token_cannot_be_used_as_access_token():
+    # Token-confusion guard: a verification token must NOT authenticate the API.
+    token = security.create_email_verification_token("user-1", "u@example.com")
+    with pytest.raises(jwt.InvalidAudienceError):
+        security.decode_access_token(token)
+
+
+def test_access_token_cannot_be_used_as_verification_token():
+    # ...and the reverse: an access token is rejected at the verification endpoint.
+    token = security.create_access_token({"sub": "user-1"})
+    with pytest.raises(jwt.PyJWTError):
+        security.decode_email_verification_token(token)
