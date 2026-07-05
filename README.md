@@ -40,6 +40,9 @@ Key environment variables:
 - `SUPABASE_SERVICE_ROLE_KEY` — Supabase service role key for Storage access
 - `SECRET_KEY` — JWT signing key (required in non-local environments; app refuses to boot without it in production)
 - `STRIPE_SECRET_KEY` — Stripe API key (for billing, if enabled)
+- `RESEND_API_KEY` — [Resend](https://resend.com) API key for transactional email. Leave empty to disable outbound email (sends become logged no-ops — handy for local/dev)
+- `EMAIL_FROM` / `EMAIL_FROM_NAME` — sender identity. `EMAIL_FROM` must be on a domain verified in Resend; `onboarding@resend.dev` is Resend's sandbox sender (only delivers to your own account address until a domain is verified)
+- `FRONTEND_URL` — base URL that hosts the `/verify-email?token=...` landing page
 
 ### 3. Run Migrations
 
@@ -161,6 +164,29 @@ Each layer communicates only with the layer below it. This separation ensures cl
 - **Authentication** — JWT-based with revocation (denylist in `revoked_tokens` table)
 - **Rate Limiting** — In-process sliding window limiter per IP+email (swap for Redis for multi-instance)
 - **Storage** — Supabase Storage for audio files (buckets: `audio-inputs`, `audio-stems`)
+- **Email** — Transactional email via [Resend](https://resend.com). `app/core/email.py` is the async transport (no-op when unconfigured); `app/services/email_service.py` composes messages and drives the email-verification flow
+
+### Email & Verification
+
+Registration sends a verification email (fire-and-forget background task — a
+failed email never fails registration). Verification links carry a short-lived,
+**single-use** JWT scoped to a dedicated audience so it can never be replayed as
+an API access token; on confirm, its `jti` is added to the `revoked_tokens`
+denylist so the same link cannot be used twice. Expiry is set by
+`EMAIL_VERIFICATION_TOKEN_EXPIRE_HOURS` (24h default).
+
+Endpoints (`/api/v1/auth`):
+- `POST /verify-email/request` — `{ "email": "..." }` (re)sends the link; always returns a generic message (no account enumeration)
+- `POST /verify-email/confirm` — `{ "token": "..." }` marks the address verified (`400` on invalid/expired token)
+
+Verify the integration end-to-end with a real send (needs `RESEND_API_KEY` in `.env`):
+
+```bash
+python -m scripts.send_test_email you@example.com
+```
+
+While `EMAIL_FROM` is the sandbox sender (`onboarding@resend.dev`), Resend only
+delivers to the address that owns your Resend account until you verify a domain.
 
 ## Common Tasks
 

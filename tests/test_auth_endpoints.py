@@ -127,3 +127,71 @@ async def test_logout_revokes_token(client, monkeypatch, sample_user):
 async def test_logout_requires_valid_token(client):
     resp = await client.post("/api/v1/auth/logout")
     assert resp.status_code == 401
+
+
+async def test_register_triggers_verification_email(client, monkeypatch, sample_user):
+    monkeypatch.setattr(
+        auth_module.user_service, "create_user", AsyncMock(return_value=sample_user)
+    )
+    send = AsyncMock(return_value="msg_1")
+    monkeypatch.setattr(auth_module.email_service, "send_verification_email", send)
+
+    resp = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "user@example.com", "password": "secret123"},
+    )
+    assert resp.status_code == 201
+    # Background task runs within the request lifecycle under ASGITransport.
+    send.assert_awaited_once_with(sample_user)
+
+
+async def test_verify_email_request_sends_for_unverified_user(client, monkeypatch, sample_user):
+    sample_user.is_verified = False
+    monkeypatch.setattr(
+        auth_module.user_service.repository, "get_by_email", AsyncMock(return_value=sample_user)
+    )
+    send = AsyncMock(return_value="msg_1")
+    monkeypatch.setattr(auth_module.email_service, "send_verification_email", send)
+
+    resp = await client.post(
+        "/api/v1/auth/verify-email/request", json={"email": sample_user.email}
+    )
+    assert resp.status_code == 200
+    send.assert_awaited_once_with(sample_user)
+
+
+async def test_verify_email_request_is_generic_for_unknown_email(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_module.user_service.repository, "get_by_email", AsyncMock(return_value=None)
+    )
+    send = AsyncMock()
+    monkeypatch.setattr(auth_module.email_service, "send_verification_email", send)
+
+    resp = await client.post(
+        "/api/v1/auth/verify-email/request", json={"email": "ghost@example.com"}
+    )
+    # Same 200 + message whether or not the account exists (no enumeration).
+    assert resp.status_code == 200
+    assert "if an account exists" in resp.json()["detail"].lower()
+    send.assert_not_awaited()
+
+
+async def test_verify_email_confirm_success(client, monkeypatch, sample_user):
+    monkeypatch.setattr(
+        auth_module.email_service, "verify_email_token", AsyncMock(return_value=sample_user)
+    )
+    resp = await client.post(
+        "/api/v1/auth/verify-email/confirm", json={"token": "valid-token"}
+    )
+    assert resp.status_code == 200
+    assert "verified" in resp.json()["detail"].lower()
+
+
+async def test_verify_email_confirm_invalid_token_returns_400(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_module.email_service, "verify_email_token", AsyncMock(return_value=None)
+    )
+    resp = await client.post(
+        "/api/v1/auth/verify-email/confirm", json={"token": "bad-token"}
+    )
+    assert resp.status_code == 400

@@ -1,7 +1,7 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,8 +10,10 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import SlidingWindowRateLimiter
 from app.core.security import create_access_token
+from app.schemas.email import MessageResponse, VerificationRequest, VerifyEmailRequest
 from app.schemas.user import Token, UserCreate, UserResponse
 from app.services.auth_service import auth_service
+from app.services.email_service import email_service
 from app.services.user_service import user_service
 
 router = APIRouter()
@@ -30,8 +32,12 @@ _INVALID_CREDENTIALS = "Incorrect email or password"
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)) -> Any:
-    """Register a new user."""
+async def register(
+    user_in: UserCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Register a new user and send a verification email."""
     try:
         user = await user_service.create_user(db, user_in)
     except ValueError as exc:
@@ -41,6 +47,8 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)) -> A
             detail="Unable to register with the provided details.",
         )
     logger.info("Registered user_id=%s", user.id)
+    # Fire-and-forget: a failed email must not fail registration.
+    background_tasks.add_task(email_service.send_verification_email, user)
     return user
 
 
@@ -95,3 +103,40 @@ async def logout(
     if jti and exp:
         await auth_service.logout(db, jti=jti, exp_timestamp=int(exp))
     return {"detail": "Successfully logged out"}
+
+
+@router.post("/verify-email/request", response_model=MessageResponse)
+async def request_email_verification(
+    body: VerificationRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """(Re)send a verification email.
+
+    Always returns the same generic message so the endpoint can't be used to
+    probe which addresses have accounts. The email is only actually sent when a
+    matching, not-yet-verified user exists.
+    """
+    user = await user_service.repository.get_by_email(db, body.email)
+    if user is not None and not user.is_verified:
+        background_tasks.add_task(email_service.send_verification_email, user)
+    else:
+        logger.info("Verification requested for non-eligible email=%s", body.email)
+    return MessageResponse(
+        detail="If an account exists for that address, a verification email has been sent."
+    )
+
+
+@router.post("/verify-email/confirm", response_model=MessageResponse)
+async def confirm_email_verification(
+    body: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Confirm an email address using the token from the verification link."""
+    user = await email_service.verify_email_token(db, body.token)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification token.",
+        )
+    return MessageResponse(detail="Email verified successfully.")

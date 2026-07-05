@@ -98,6 +98,89 @@ class ProjectService:
         await db.refresh(project, attribute_names=["input_file"])
         return project
 
+    async def create_upload_url(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: uuid.UUID,
+        name: str,
+        filename: str,
+        content_type: str,
+    ) -> tuple[Project, dict[str, str]]:
+        """Create a project and mint a presigned URL for a *direct* client upload.
+
+        The bytes go client -> Supabase; the API only validates the declared
+        content type and hands back a one-time upload URL. The final file
+        metadata is recorded later by :meth:`complete_upload`.
+
+        Raises ``ValueError`` on an unsupported content type.
+        """
+        settings = get_settings()
+
+        content_type = (content_type or "").lower()
+        if content_type not in settings.allowed_audio_content_type_set:
+            raise ValueError(f"Unsupported audio content type: {content_type or 'unknown'}")
+
+        original_filename = _sanitize_filename(filename)
+
+        # Create the project first so the storage key can be namespaced by its id.
+        project = await self.repository.create(
+            db,
+            ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.UPLOADING),
+        )
+        storage_key = f"{user_id}/{project.id}/{original_filename}"
+
+        signed = await run_in_threadpool(
+            storage.create_signed_upload_url,
+            storage.BUCKET_INPUTS,
+            storage_key,
+        )
+        await db.commit()
+        await db.refresh(project)
+
+        return project, {"storage_key": storage_key, **signed}
+
+    async def complete_upload(
+        self, db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID
+    ) -> Project | None:
+        """Confirm a presigned upload finished, recording the stored file.
+
+        Verifies the object actually landed in storage (never trusting client
+        input) and reads its real size / content type before moving the project
+        to ``QUEUED``. Returns ``None`` if the project isn't found for the user;
+        raises ``ValueError`` if no uploaded file exists under the project prefix.
+        """
+        project = await self.repository.get_for_user(db, project_id, user_id)
+        if project is None:
+            return None
+        if project.input_file is not None:
+            return project  # already completed — idempotent
+
+        prefix = f"{user_id}/{project.id}"
+        objects = await run_in_threadpool(
+            storage.list_objects, storage.BUCKET_INPUTS, prefix
+        )
+        stored = next((o for o in objects if o.get("name")), None)
+        if stored is None:
+            raise ValueError("No uploaded file found for this project")
+
+        metadata = stored.get("metadata") or {}
+        filename = stored["name"]
+
+        await self.file_repository.create_for_project(
+            db,
+            project_id=project.id,
+            original_filename=filename,
+            storage_key=f"{prefix}/{filename}",
+            file_size_bytes=int(metadata.get("size") or 0),
+            content_type=metadata.get("mimetype") or "application/octet-stream",
+        )
+        project = await self.repository.update(db, project, {"status": ProjectStatus.QUEUED})
+        await db.commit()
+
+        await db.refresh(project, attribute_names=["input_file"])
+        return project
+
     async def get_input_url(
         self, db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID, expires_in: int = 3600
     ) -> str | None:

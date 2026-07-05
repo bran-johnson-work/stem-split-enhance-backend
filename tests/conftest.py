@@ -13,9 +13,26 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.main import app
 from app.models.user import User
+
+
+@pytest.fixture(autouse=True)
+def _disable_outbound_email():
+    """Keep the suite network-free even if ``.env`` carries a real RESEND_API_KEY.
+
+    Blanking the key on the cached settings makes ``send_email`` short-circuit to
+    a logged no-op, so background verification sends triggered by e.g. register
+    never touch the network. Tests that exercise the email transport patch
+    ``get_settings``/``httpx`` themselves and are unaffected.
+    """
+    settings = get_settings()
+    original = settings.resend_api_key
+    settings.resend_api_key = ""
+    yield
+    settings.resend_api_key = original
 
 
 @pytest.fixture

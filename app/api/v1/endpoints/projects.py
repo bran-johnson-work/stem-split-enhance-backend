@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_current_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.project import InputUrlResponse, ProjectResponse
+from app.schemas.project import (
+    InputUrlResponse,
+    ProjectResponse,
+    UploadUrlRequest,
+    UploadUrlResponse,
+)
 from app.services.project_service import project_service
 
 router = APIRouter()
@@ -28,6 +33,56 @@ async def upload_audio(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return project
+
+
+@router.post(
+    "/upload-url", response_model=UploadUrlResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_upload_url(
+    payload: UploadUrlRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Create a project and return a one-time URL to upload its audio directly.
+
+    The client PUTs the file to the returned ``url`` (with ``token``), then calls
+    ``/{project_id}/upload-complete`` to finalise it.
+    """
+    project_name = (payload.name or "").strip() or (payload.filename or "Untitled project")
+    try:
+        project, signed = await project_service.create_upload_url(
+            db,
+            user_id=current_user.id,
+            name=project_name,
+            filename=payload.filename,
+            content_type=payload.content_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return UploadUrlResponse(
+        project_id=project.id,
+        storage_key=signed["storage_key"],
+        url=signed["url"],
+        token=signed["token"],
+    )
+
+
+@router.post("/{project_id}/upload-complete", response_model=ProjectResponse)
+async def complete_upload(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Finalise a presigned upload: verify the file landed and queue the project."""
+    try:
+        project = await project_service.complete_upload(
+            db, project_id=project_id, user_id=current_user.id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project
 
 

@@ -43,3 +43,20 @@ class ProjectResponse(BaseModel):
 class InputUrlResponse(BaseModel):
     url: str
     expires_in: int
+
+
+class UploadUrlRequest(BaseModel):
+    """Client's request for a presigned upload URL, before any bytes are sent."""
+
+    filename: str
+    content_type: str
+    name: str | None = None
+
+
+class UploadUrlResponse(BaseModel):
+    """A one-time URL the client uploads the audio file directly to Supabase with."""
+
+    project_id: uuid.UUID
+    storage_key: str
+    url: str
+    token: str

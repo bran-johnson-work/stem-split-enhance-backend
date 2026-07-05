@@ -81,3 +81,55 @@ def decode_access_token(token: str) -> dict[str, Any]:
         issuer=settings.jwt_issuer,
         options={"require": ["exp", "iat", "sub", "jti"]},
     )
+
+
+# Single-purpose token type carried in the ``purpose`` claim. Verification links
+# reuse the JWT machinery (signed, expiring, self-contained) so no extra table is
+# needed. Two independent guards stop these tokens being confused with API access
+# tokens: a distinct ``aud`` (rejected by ``decode_access_token``'s audience
+# check) and this ``purpose`` claim (checked below). Either alone is sufficient.
+EMAIL_VERIFICATION_PURPOSE = "email_verification"
+
+
+def create_email_verification_token(user_id: str, email: str) -> str:
+    """Create a short-lived signed token proving ownership of ``email``.
+
+    Expires after ``email_verification_token_expire_hours`` (24h by default) and
+    is scoped to the email-verification audience so it cannot be replayed as an
+    API access token.
+    """
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(hours=settings.email_verification_token_expire_hours)
+    to_encode = {
+        "sub": user_id,
+        "email": email,
+        "purpose": EMAIL_VERIFICATION_PURPOSE,
+        "iat": now,
+        "nbf": now,
+        "exp": expire,
+        "jti": str(uuid4()),
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_email_verification_audience,
+    }
+    return jwt.encode(to_encode, settings.secret_key, algorithm=settings.jwt_algorithm)
+
+
+def decode_email_verification_token(token: str) -> dict[str, Any]:
+    """Decode and validate an email-verification token.
+
+    Enforces signature, expiry (``exp``), not-before, issuer and the dedicated
+    email-verification audience. Raises ``jwt.PyJWTError`` on any validation
+    failure, including a token whose ``purpose`` claim is not the
+    email-verification purpose (e.g. an access token presented here).
+    """
+    payload = jwt.decode(
+        token,
+        settings.secret_key,
+        algorithms=[settings.jwt_algorithm],
+        audience=settings.jwt_email_verification_audience,
+        issuer=settings.jwt_issuer,
+        options={"require": ["exp", "iat", "sub", "jti"]},
+    )
+    if payload.get("purpose") != EMAIL_VERIFICATION_PURPOSE:
+        raise jwt.InvalidTokenError("Token is not an email-verification token")
+    return payload

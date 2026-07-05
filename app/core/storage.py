@@ -63,6 +63,29 @@ def get_signed_url(bucket: str, path: str, expires_in: int = 3600) -> str:
     return response["signedURL"]
 
 
+def create_signed_upload_url(bucket: str, path: str) -> dict[str, str]:
+    """Mint a one-time signed URL the client can upload *directly* to.
+
+    Returns ``{"url": ..., "token": ..., "path": ...}``. The file bytes never
+    pass through the API and the service_role key stays server-side; the bucket's
+    own ``file_size_limit`` / ``allowed_mime_types`` enforce the constraints at
+    upload time. The token is single-use and expires (Supabase default ~2h).
+    """
+    client = get_storage_client()
+    response = client.storage.from_(bucket).create_signed_upload_url(path)
+    return {
+        "url": response["signed_url"],
+        "token": response["token"],
+        "path": response["path"],
+    }
+
+
+def list_objects(bucket: str, prefix: str) -> list[dict]:
+    """List objects stored directly under ``prefix`` (non-recursive)."""
+    client = get_storage_client()
+    return client.storage.from_(bucket).list(prefix)
+
+
 def delete_file(bucket: str, path: str) -> None:
     client = get_storage_client()
     client.storage.from_(bucket).remove([path])

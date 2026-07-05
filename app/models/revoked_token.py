@@ -9,10 +9,11 @@ from app.models.base import Base, TimestampMixin, new_uuid
 
 
 class RevokedToken(Base, TimestampMixin):
-    """A denylist of JWT ``jti`` values invalidated by logout.
+    """A denylist of consumed/invalidated JWT ``jti`` values.
 
-    Rows can be purged once ``expires_at`` has passed, since an expired token is
-    already rejected by signature/exp validation.
+    Populated on logout (access tokens) and when an email-verification token is
+    used (enforcing single-use). Rows can be purged once ``expires_at`` has
+    passed, since an expired token is already rejected by signature/exp validation.
     """
 
     __tablename__ = "revoked_tokens"
