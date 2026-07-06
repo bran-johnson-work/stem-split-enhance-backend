@@ -30,12 +30,16 @@ def hash_password(password: str) -> str:
     return f"{_HASH_PREFIX}${iterations}${salt.hex()}${digest.hex()}"
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
+def verify_password(plain_password: str, hashed_password: str | None) -> bool:
     """Verify a password against a stored hash in constant time.
 
     Supports both the current self-describing format and the legacy
-    ``salt:hash`` form (assumed to be 100k iterations).
+    ``salt:hash`` form (assumed to be 100k iterations). Returns ``False`` for a
+    missing/empty stored hash, so passwordless (OAuth2) accounts can never be
+    authenticated via a password — including an empty one.
     """
+    if not hashed_password:
+        return False
     try:
         if hashed_password.startswith(f"{_HASH_PREFIX}$"):
             _, iter_str, salt_hex, hash_hex = hashed_password.split("$")

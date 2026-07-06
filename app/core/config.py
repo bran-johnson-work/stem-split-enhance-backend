@@ -26,8 +26,6 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "ai-audio-stem-api"
     jwt_audience: str = "ai-audio-stem-api-clients"
-    # Distinct audience for email-verification links so they can never be replayed
-    # as API access tokens (standard JWT audience validation rejects the mismatch).
     jwt_email_verification_audience: str = "ai-audio-stem-api-email-verification"
     access_token_expire_minutes: int = 30
 
@@ -37,6 +35,10 @@ class Settings(BaseSettings):
     # Login brute-force throttle (per client IP + email, sliding window)
     login_rate_limit_max_attempts: int = 5
     login_rate_limit_window_seconds: int = 300
+
+
+    signup_rate_limit_max_attempts: int = 10
+    signup_rate_limit_window_seconds: int = 3600
 
     # Audio uploads. 50 MB matches the Supabase Free-plan global upload ceiling;
     # raise this (and the project's Storage limit) on a paid plan if needed.
@@ -51,9 +53,7 @@ class Settings(BaseSettings):
     # a warning), which keeps the test suite and local dev network-free.
     resend_api_key: str = ""
     resend_api_base_url: str = "https://api.resend.com"
-    # Sender identity. ``email_from`` must be an address on a domain verified in
-    # the Resend dashboard; "onboarding@resend.dev" is Resend's shared sandbox
-    # sender, usable without domain verification for first-run testing.
+
     email_from: str = "onboarding@resend.dev"
     email_from_name: str = "AI Audio Stem"
     email_timeout_seconds: float = 10.0
@@ -61,10 +61,7 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     # How long an email-verification link stays valid.
     email_verification_token_expire_hours: int = 24
-    # Require a verified email before login is allowed. Set to ``false`` for local
-    # dev where transactional email may not be deliverable (e.g. Resend sandbox,
-    # which only delivers to the account owner) — the verification link is still
-    # logged in local env so the flow can be completed manually.
+
     require_email_verification: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -124,6 +121,11 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "SECRET_KEY must be set to a strong, unique value in non-local "
                 "environments (it is unset or still the insecure default)."
+            )
+        if "*" in self.cors_origin_list:
+            raise RuntimeError(
+                "CORS_ORIGINS must list explicit origins in non-local environments; "
+                "the '*' wildcard is not allowed in production."
             )
 
 
