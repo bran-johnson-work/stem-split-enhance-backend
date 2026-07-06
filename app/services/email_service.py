@@ -63,6 +63,9 @@ class EmailService:
         """
         token = create_email_verification_token(str(user.id), user.email)
         link = self._verification_link(token)
+
+        if get_settings().is_local:
+            logger.info("Local email-verification link for %s: %s", user.email, link)
         greeting = f"Hi {user.full_name}," if user.full_name else "Hi,"
         html = _wrap(
             "Confirm your email",
