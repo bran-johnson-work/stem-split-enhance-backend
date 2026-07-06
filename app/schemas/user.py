@@ -1,24 +1,29 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+_PASSWORD_MIN = 8
+_PASSWORD_MAX = 128
 
 
 class UserBase(BaseModel):
-    email: str
-    full_name: str | None = None
+    email: EmailStr
+    full_name: str | None = Field(default=None, max_length=255)
 
 
 class UserCreate(UserBase):
-    password: str
+
+    password: str = Field(min_length=_PASSWORD_MIN, max_length=_PASSWORD_MAX)
 
 
 class UserUpdate(BaseModel):
-    email: str | None = None
-    password: str | None = None
-    full_name: str | None = None
-    is_active: bool | None = None
-    is_verified: bool | None = None
+    email: EmailStr | None = None
+    password: str | None = Field(default=None, min_length=_PASSWORD_MIN, max_length=_PASSWORD_MAX)
+    full_name: str | None = Field(default=None, max_length=255)
+    # NOTE: ``is_active`` / ``is_verified`` are server-controlled and deliberately
+
 
 
 class UserResponse(UserBase):

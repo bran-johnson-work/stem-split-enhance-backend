@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 
 class MessageResponse(BaseModel):
@@ -10,7 +10,7 @@ class MessageResponse(BaseModel):
 class VerificationRequest(BaseModel):
     """Ask for a fresh verification email to be sent to ``email``."""
 
-    email: str
+    email: EmailStr
 
 
 class VerifyEmailRequest(BaseModel):

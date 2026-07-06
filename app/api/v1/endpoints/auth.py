@@ -27,17 +27,42 @@ login_rate_limiter = SlidingWindowRateLimiter(
     window_seconds=settings.login_rate_limit_window_seconds,
 )
 
+# Per-IP throttle for the unauthenticated, email-triggering endpoints
+# (register, verify-email/request) to curb signup spam / email bombing.
+signup_rate_limiter = SlidingWindowRateLimiter(
+    max_attempts=settings.signup_rate_limit_max_attempts,
+    window_seconds=settings.signup_rate_limit_window_seconds,
+)
+
 # Generic, non-enumerable client-facing message. The real reason is logged.
 _INVALID_CREDENTIALS = "Incorrect email or password"
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_signup_rate_limit(request: Request) -> None:
+    """Throttle an email-triggering endpoint per client IP; 429 when exceeded."""
+    key = _client_ip(request)
+    if signup_rate_limiter.is_blocked(key):
+        logger.warning("Signup/verification rate limit exceeded for %s", key)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests. Please try again later.",
+        )
+    signup_rate_limiter.register_failure(key)
+
+
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(
+    request: Request,
     user_in: UserCreate,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     """Register a new user and send a verification email."""
+    _enforce_signup_rate_limit(request)
     try:
         user = await user_service.create_user(db, user_in)
     except ValueError as exc:
@@ -118,6 +143,7 @@ async def logout(
 
 @router.post("/verify-email/request", response_model=MessageResponse)
 async def request_email_verification(
+    request: Request,
     body: VerificationRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
@@ -128,6 +154,7 @@ async def request_email_verification(
     probe which addresses have accounts. The email is only actually sent when a
     matching, not-yet-verified user exists.
     """
+    _enforce_signup_rate_limit(request)
     user = await user_service.repository.get_by_email(db, body.email)
     if user is not None and not user.is_verified:
         background_tasks.add_task(email_service.send_verification_email, user)
