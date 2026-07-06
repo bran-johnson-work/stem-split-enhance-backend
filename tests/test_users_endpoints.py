@@ -31,15 +31,55 @@ async def test_read_user_found(auth_client, monkeypatch, sample_user):
     assert resp.json()["id"] == str(sample_user.id)
 
 
-async def test_read_user_not_found(auth_client, monkeypatch):
-    monkeypatch.setattr(users_module.user_service.repository, "get", AsyncMock(return_value=None))
+async def test_read_other_user_forbidden(auth_client):
+    # A user may only read their own record; another id is rejected (no IDOR).
     resp = await auth_client.get(f"/api/v1/users/{uuid.uuid4()}")
+    assert resp.status_code == 403
+
+
+async def test_read_own_user_missing_returns_404(auth_client, monkeypatch, sample_user):
+    # Reading self, but the record no longer resolves -> 404 (not 403).
+    monkeypatch.setattr(users_module.user_service.repository, "get", AsyncMock(return_value=None))
+    resp = await auth_client.get(f"/api/v1/users/{sample_user.id}")
     assert resp.status_code == 404
 
 
 async def test_update_user_forbidden_for_other_user(auth_client):
     resp = await auth_client.patch(f"/api/v1/users/{uuid.uuid4()}", json={"full_name": "New"})
     assert resp.status_code == 403
+
+
+async def test_update_user_cannot_self_verify(auth_client, monkeypatch, sample_user):
+    # Mass-assignment guard: is_verified/is_active are not fields on UserUpdate,
+    # so even if a client sends them the service never receives them and cannot
+    # flip server-controlled flags.
+    captured = {}
+
+    async def _capture(db, *, user_id, user_in):
+        captured["data"] = user_in.model_dump(exclude_unset=True)
+        return sample_user
+
+    monkeypatch.setattr(users_module.user_service, "update_user", _capture)
+    resp = await auth_client.patch(
+        f"/api/v1/users/{sample_user.id}",
+        json={"is_verified": True, "is_active": True, "full_name": "Legit"},
+    )
+    assert resp.status_code == 200
+    assert "is_verified" not in captured["data"]
+    assert "is_active" not in captured["data"]
+    assert captured["data"] == {"full_name": "Legit"}
+
+
+async def test_update_user_duplicate_email_returns_409(auth_client, monkeypatch, sample_user):
+    monkeypatch.setattr(
+        users_module.user_service,
+        "update_user",
+        AsyncMock(side_effect=ValueError("Email already registered")),
+    )
+    resp = await auth_client.patch(
+        f"/api/v1/users/{sample_user.id}", json={"email": "taken@example.com"}
+    )
+    assert resp.status_code == 409
 
 
 async def test_update_user_success(auth_client, monkeypatch, sample_user):

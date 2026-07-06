@@ -1,7 +1,7 @@
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_user
@@ -134,8 +134,8 @@ async def complete_upload(
 
 @router.get("", response_model=list[ProjectResponse])
 async def list_projects(
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
@@ -162,7 +162,8 @@ async def read_project(
 async def get_input_url(
     project_id: uuid.UUID,
     file_id: uuid.UUID | None = None,
-    expires_in: int = 3600,
+    # Bounded 1s..7d so a caller can't request a negative/absurd TTL.
+    expires_in: int = Query(3600, gt=0, le=604800),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:

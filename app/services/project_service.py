@@ -146,9 +146,12 @@ class ProjectService:
         if target is None:
             return False
 
-        await run_in_threadpool(
-            storage.delete_file, storage.BUCKET_INPUTS, target.storage_key
-        )
+        try:
+            await run_in_threadpool(
+                storage.delete_file, storage.BUCKET_INPUTS, target.storage_key
+            )
+        except Exception:  # pragma: no cover - storage cleanup is best-effort
+            logger.warning("Failed to delete storage object %s", target.storage_key)
         await db.delete(target)
         await db.commit()
         return True

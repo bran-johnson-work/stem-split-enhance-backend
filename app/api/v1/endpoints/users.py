@@ -25,7 +25,13 @@ async def read_user(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    """Get user by ID."""
+    """Get user by ID (own account only)."""
+    # Object-level authorization: a user may only read their own record. Without
+    # this any authenticated user could enumerate every account's email/status.
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this user"
+        )
     user = await user_service.repository.get(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -45,7 +51,10 @@ async def update_user(
             status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update this user"
         )
 
-    updated_user = await user_service.update_user(db, user_id=user_id, user_in=user_in)
+    try:
+        updated_user = await user_service.update_user(db, user_id=user_id, user_in=user_in)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if not updated_user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return updated_user

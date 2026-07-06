@@ -1,21 +1,27 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.project import ProjectStatus
+
+# Matches the ``String(255)`` columns; bounding at the schema returns a clean 422
+# instead of letting an over-long value reach the DB and surface as a 500.
+_NAME_MAX = 255
+_FILENAME_MAX = 255
+_CONTENT_TYPE_MAX = 255
 
 
 class ProjectCreate(BaseModel):
     user_id: uuid.UUID
-    name: str
+    name: str = Field(max_length=_NAME_MAX)
     status: ProjectStatus = ProjectStatus.PENDING
 
 
 class ProjectCreateRequest(BaseModel):
     """Client payload for creating an empty project (before any file is uploaded)."""
 
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class ProjectUpdate(BaseModel):
@@ -54,9 +60,9 @@ class InputUrlResponse(BaseModel):
 class UploadUrlRequest(BaseModel):
     """Client's request for a presigned upload URL, before any bytes are sent."""
 
-    filename: str
-    content_type: str
-    name: str | None = None
+    filename: str = Field(min_length=1, max_length=_FILENAME_MAX)
+    content_type: str = Field(min_length=1, max_length=_CONTENT_TYPE_MAX)
+    name: str | None = Field(default=None, max_length=_NAME_MAX)
     # When set, add the file to an existing project instead of creating a new one.
     project_id: uuid.UUID | None = None
 
@@ -64,8 +70,8 @@ class UploadUrlRequest(BaseModel):
 class FileUploadUrlRequest(BaseModel):
     """Client's request for a presigned URL to add a file to an existing project."""
 
-    filename: str
-    content_type: str
+    filename: str = Field(min_length=1, max_length=_FILENAME_MAX)
+    content_type: str = Field(min_length=1, max_length=_CONTENT_TYPE_MAX)
 
 
 class UploadUrlResponse(BaseModel):

@@ -7,10 +7,12 @@ from app.api.v1.endpoints import auth as auth_module
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limiter():
-    """Isolate the module-level login throttle between tests."""
+    """Isolate the module-level throttles between tests."""
     auth_module.login_rate_limiter.clear()
+    auth_module.signup_rate_limiter.clear()
     yield
     auth_module.login_rate_limiter.clear()
+    auth_module.signup_rate_limiter.clear()
 
 
 async def test_register_returns_201(client, monkeypatch, sample_user):
@@ -44,6 +46,27 @@ async def test_register_duplicate_returns_generic_400(client, monkeypatch):
 
 async def test_register_validation_error_returns_422(client):
     resp = await client.post("/api/v1/auth/register", json={"email": "user@example.com"})
+    assert resp.status_code == 422
+
+
+async def test_register_rejects_invalid_email(client):
+    resp = await client.post(
+        "/api/v1/auth/register", json={"email": "not-an-email", "password": "secret123"}
+    )
+    assert resp.status_code == 422
+
+
+async def test_register_rejects_short_password(client):
+    resp = await client.post(
+        "/api/v1/auth/register", json={"email": "user@example.com", "password": "short"}
+    )
+    assert resp.status_code == 422
+
+
+async def test_register_rejects_empty_password(client):
+    resp = await client.post(
+        "/api/v1/auth/register", json={"email": "user@example.com", "password": ""}
+    )
     assert resp.status_code == 422
 
 

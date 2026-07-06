@@ -1,11 +1,15 @@
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -39,6 +43,22 @@ app.add_middleware(
 )
 
 app.include_router(api_router, prefix="/api/v1")
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(request: Request, exc: IntegrityError) -> JSONResponse:
+    """Safety net: turn an uncaught DB constraint violation into a 409, not a 500.
+
+    Services translate the constraints they know about (e.g. duplicate email)
+    into clean errors; this catches anything that slips through so the client
+    gets a sane status and the detail (which can leak schema internals) is only
+    logged, never returned.
+    """
+    logger.warning("Unhandled IntegrityError on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={"detail": "The request conflicts with the current state of the resource."},
+    )
 
 
 @app.get("/health")
