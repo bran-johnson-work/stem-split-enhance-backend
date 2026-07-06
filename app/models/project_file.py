@@ -17,10 +17,11 @@ class ProjectFile(Base, TimestampMixin):
     __tablename__ = "project_files"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    # A project can own many input files (one-to-many); indexed for FK lookups.
     project_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("projects.id", ondelete="CASCADE"),
-        unique=True,
+        index=True,
         nullable=False,
     )
     original_filename: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -28,4 +29,4 @@ class ProjectFile(Base, TimestampMixin):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    project: Mapped["Project"] = relationship("Project", back_populates="input_file")
+    project: Mapped["Project"] = relationship("Project", back_populates="input_files")

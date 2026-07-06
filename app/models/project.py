@@ -37,8 +37,11 @@ class Project(Base, TimestampMixin):
     )
 
     user: Mapped["User"] = relationship("User", back_populates="projects")
-    input_file: Mapped["ProjectFile | None"] = relationship(
-        "ProjectFile", back_populates="project", uselist=False, cascade="all, delete-orphan"
+    input_files: Mapped[list["ProjectFile"]] = relationship(
+        "ProjectFile",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectFile.created_at",
     )
     processing_jobs: Mapped[list["ProcessingJob"]] = relationship(
         "ProcessingJob",

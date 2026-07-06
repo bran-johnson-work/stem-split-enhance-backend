@@ -89,3 +89,16 @@ def list_objects(bucket: str, prefix: str) -> list[dict]:
 def delete_file(bucket: str, path: str) -> None:
     client = get_storage_client()
     client.storage.from_(bucket).remove([path])
+
+
+def delete_prefix(bucket: str, prefix: str) -> None:
+    """Delete every object stored directly under ``prefix`` (non-recursive).
+
+    Used to purge a project's storage when the project (or all its uploads) is
+    deleted. No-op when the prefix is already empty.
+    """
+    client = get_storage_client()
+    objects = client.storage.from_(bucket).list(prefix)
+    paths = [f"{prefix}/{o['name']}" for o in objects if o.get("name")]
+    if paths:
+        client.storage.from_(bucket).remove(paths)
