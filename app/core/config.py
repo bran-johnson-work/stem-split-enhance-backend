@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     # How long an email-verification link stays valid.
     email_verification_token_expire_hours: int = 24
+    # Require a verified email before login is allowed. Set to ``false`` for local
+    # dev where transactional email may not be deliverable (e.g. Resend sandbox,
+    # which only delivers to the account owner) — the verification link is still
+    # logged in local env so the flow can be completed manually.
+    require_email_verification: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -89,6 +94,16 @@ class Settings(BaseSettings):
     def email_enabled(self) -> bool:
         """Whether outbound email is configured (a Resend API key is present)."""
         return bool(self.resend_api_key)
+
+    @property
+    def email_uses_sandbox_sender(self) -> bool:
+        """True when EMAIL_FROM is Resend's shared sandbox address.
+
+        With this sender Resend only delivers to the address that owns the
+        account (any other recipient is rejected with HTTP 403), so verification
+        emails to real signups silently never arrive until a domain is verified.
+        """
+        return self.email_from.strip().lower() == "onboarding@resend.dev"
 
     @property
     def email_sender(self) -> str:

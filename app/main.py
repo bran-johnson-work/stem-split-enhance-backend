@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10,6 +12,18 @@ settings = get_settings()
 configure_logging(settings.log_level)
 # Refuse to boot with insecure config (e.g. missing SECRET_KEY) outside local.
 settings.assert_production_ready()
+
+# Surface the Resend sandbox limitation loudly at startup: with the sandbox
+# sender, verification emails to any address other than the account owner are
+# rejected (403) and — since sends are fire-and-forget — fail silently.
+if settings.email_enabled and settings.email_uses_sandbox_sender:
+    logging.getLogger(__name__).warning(
+        "Email is enabled but EMAIL_FROM is Resend's sandbox sender "
+        "(%s); Resend will ONLY deliver to the address that owns the API key. "
+        "Verify a domain at resend.com/domains and set EMAIL_FROM to it to send "
+        "verification emails to real users.",
+        settings.email_from,
+    )
 
 app = FastAPI(
     title="AI Audio Stem API",

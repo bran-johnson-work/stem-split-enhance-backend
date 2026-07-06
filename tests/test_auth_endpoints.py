@@ -49,6 +49,7 @@ async def test_register_validation_error_returns_422(client):
 
 async def test_login_returns_token(client, monkeypatch, sample_user):
     sample_user.is_active = True
+    sample_user.is_verified = True
     monkeypatch.setattr(
         auth_module.user_service, "authenticate", AsyncMock(return_value=sample_user)
     )
@@ -60,6 +61,21 @@ async def test_login_returns_token(client, monkeypatch, sample_user):
     body = resp.json()
     assert body["token_type"] == "bearer"
     assert body["access_token"]
+
+
+async def test_login_unverified_user_returns_403(client, monkeypatch, sample_user):
+    sample_user.is_active = True
+    sample_user.is_verified = False
+    monkeypatch.setattr(
+        auth_module.user_service, "authenticate", AsyncMock(return_value=sample_user)
+    )
+    resp = await client.post(
+        "/api/v1/auth/login",
+        data={"username": sample_user.email, "password": "secret123"},
+    )
+    # Correct credentials but unverified email -> blocked with a distinct 403.
+    assert resp.status_code == 403
+    assert "verify" in resp.json()["detail"].lower()
 
 
 async def test_login_bad_credentials_returns_401(client, monkeypatch):
@@ -106,6 +122,7 @@ async def test_login_is_rate_limited_after_repeated_failures(client, monkeypatch
 async def test_logout_revokes_token(client, monkeypatch, sample_user):
     # Authenticate to get a real token.
     sample_user.is_active = True
+    sample_user.is_verified = True
     monkeypatch.setattr(
         auth_module.user_service, "authenticate", AsyncMock(return_value=sample_user)
     )

@@ -85,6 +85,17 @@ async def login(
         )
 
     login_rate_limiter.reset(rate_key)
+
+    # Credentials are valid at this point, so gating on verification status here
+    # (rather than collapsing it into the generic 401 above) is not an account-
+    # enumeration oracle: only someone who already knows the password sees it.
+    if settings.require_email_verification and not user.is_verified:
+        logger.info("Login blocked for unverified user_id=%s", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your email address before logging in.",
+        )
+
     logger.info("Successful login user_id=%s", user.id)
     return Token(
         access_token=create_access_token(data={"sub": str(user.id)}),
