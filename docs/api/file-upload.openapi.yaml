@@ -1,0 +1,662 @@
+openapi: 3.0.3
+
+info:
+  title: AI Audio Stem API — File Upload
+  version: "1.0.0"
+  description: |
+    **Scope: File Upload feature only.**
+
+    This document is an *independent integration package* covering the endpoints
+    a client needs to get an audio file from the user's machine into a project
+    and ready for stem separation. It deliberately excludes auth, billing, and
+    stem-download endpoints — they are delivered as separate packages.
+
+    ## How uploading works (presigned, direct-to-storage)
+
+    Bytes are **never** streamed through this API. Instead the API mints a
+    one-time *presigned upload URL* pointing straight at Supabase Storage; the
+    client PUTs the file to that URL, then tells the API to finalise. This keeps
+    large uploads off the app servers and the storage secret key server-side.
+
+    ## Recommended workflow (multi-file capable)
+
+    A **project** is the container that holds one or more input files. The
+    recommended sequence is:
+
+    1. **Create a project** — `POST /projects`
+       Consumes one unit of the plan's monthly project quota. Returns the
+       `project_id`. (Do this once per project; the uploads below are free.)
+    2. **Request a presigned upload URL** — `POST /projects/{project_id}/files/upload-url`
+       Declare the `filename` and `content_type`. Returns `url` + `token` +
+       `storage_key`. Repeat per file for multi-file projects.
+    3. **Upload the bytes** — `PUT` the raw file to the returned `url`
+       (direct to Supabase Storage — *not* to this API). See
+       [Uploading the bytes](#section/Uploading-the-bytes-to-storage).
+    4. **Finalise** — `POST /projects/{project_id}/upload-complete`
+       The API verifies the object(s) landed, records file metadata, and moves
+       the project to `queued` (ready for the engine).
+    5. **Retrieve / verify** — `GET /projects/{project_id}` and, to preview the
+       original audio, `GET /projects/{project_id}/input-url`.
+
+    ### One-shot shortcut (single file)
+
+    For the simple "one project, one file" case you can skip step 1 and use
+    `POST /projects/upload-url`, which creates the project *and* returns the
+    presigned URL in a single call. Then continue at step 3.
+
+    ## Uploading the bytes to storage
+
+    The API returns Supabase's `url` (may be relative, e.g.
+    `/object/upload/sign/...`) plus a single-use `token`. To upload:
+
+    - If `url` is absolute (`https://...`), `PUT` the raw file bytes to it.
+    - If `url` is relative, prefix it with `<SUPABASE_URL>/storage/v1` to make it
+      absolute, then `PUT`.
+    - Set the request header `Content-Type` to the same value you declared when
+      requesting the URL.
+    - The token is embedded in the signed `url`; no `Authorization` header is
+      needed for the storage PUT.
+
+    The token is single-use and expires (Supabase default ~2 hours), so upload
+    promptly after minting the URL. The storage bucket independently enforces the
+    max file size (**50 MB**) and allowed MIME types.
+
+servers:
+  - url: http://localhost:8000/api/v1
+    description: Local development
+  - url: https://api.example.com/api/v1
+    description: Production (replace with the real host)
+
+tags:
+  - name: File Upload
+    description: Create projects and upload audio files via presigned URLs.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /projects:
+    post:
+      tags: [File Upload]
+      summary: Create an empty project (step 1)
+      operationId: createProject
+      description: |
+        Create an empty project to hold uploaded file(s). **This is the metered
+        unit** — it consumes one of the plan's monthly projects; the subsequent
+        presigned uploads into it are free.
+
+        The project is created with status `pending`. Uploading a file moves it
+        to `uploading`, and finalising moves it to `queued`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreateRequest'
+            examples:
+              named:
+                summary: With an explicit name
+                value: { name: "My remix session" }
+              unnamed:
+                summary: Omit name (defaults to "Untitled project")
+                value: {}
+      responses:
+        '201':
+          description: Project created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '400':
+          description: |
+            Monthly project quota exceeded (e.g. *"Monthly project limit reached
+            (N). Upgrade your plan to create more."*).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /projects/upload-url:
+    post:
+      tags: [File Upload]
+      summary: Create a project AND mint an upload URL (one-shot shortcut)
+      operationId: createProjectUploadUrl
+      description: |
+        Convenience endpoint for the single-file case: creates a new project
+        **and** returns a presigned upload URL in one call, so you can skip the
+        separate `POST /projects` step.
+
+        Consumes one monthly project quota unit (unless `project_id` is supplied,
+        in which case it targets that existing project and consumes no quota).
+        After calling this, `PUT` the bytes to the returned `url`, then call
+        `POST /projects/{project_id}/upload-complete`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadUrlRequest'
+            examples:
+              newProject:
+                summary: Create a new project and presign
+                value:
+                  filename: "vocals.wav"
+                  content_type: "audio/wav"
+                  name: "My remix session"
+              existingProject:
+                summary: Add a file to an existing project
+                value:
+                  filename: "drums.mp3"
+                  content_type: "audio/mpeg"
+                  project_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+      responses:
+        '201':
+          description: Project ready and presigned URL minted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadUrlResponse'
+        '400':
+          description: Unsupported audio content type, or monthly quota exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '`project_id` was supplied but no such project exists for this user.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+  /projects/{project_id}/files/upload-url:
+    post:
+      tags: [File Upload]
+      summary: Mint a presigned upload URL for an existing project (step 2)
+      operationId: createFileUploadUrl
+      description: |
+        Request a one-time presigned URL to upload a file into an **existing**
+        project. Call once per file — repeat for multi-file projects. No quota is
+        consumed here (the project already accounts for it).
+
+        Requesting a URL moves the project to `uploading`. After calling this,
+        `PUT` the bytes to the returned `url`, then finalise with
+        `POST /projects/{project_id}/upload-complete`.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileUploadUrlRequest'
+            examples:
+              wav:
+                value: { filename: "vocals.wav", content_type: "audio/wav" }
+      responses:
+        '201':
+          description: Presigned URL minted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadUrlResponse'
+        '400':
+          description: |
+            Unsupported audio content type. The declared `content_type` must be
+            one of the allowed audio types (see `content_type` in
+            [FileUploadUrlRequest](#/components/schemas/FileUploadUrlRequest)).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+  /projects/{project_id}/upload-complete:
+    post:
+      tags: [File Upload]
+      summary: Finalise the upload (step 4)
+      operationId: completeUpload
+      description: |
+        Call after the storage `PUT` succeeds. The API lists the project's
+        storage prefix, **verifies the uploaded object(s) actually landed**
+        (never trusting the client), records each file's real size and content
+        type under the project, and — if not already — moves the project to
+        `queued` so the stem engine can pick it up.
+
+        **Idempotent:** safe to retry. Re-recording an already-known object
+        refreshes its metadata in place; if nothing new is in storage but files
+        are already recorded, the current project is returned unchanged.
+
+        No request body is required — the project is identified by the path.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: |
+            Upload finalised. Returns the project with its populated
+            `input_files` and status advanced to `queued`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '400':
+          description: |
+            No uploaded file was found under the project's storage prefix
+            (*"No uploaded file found for this project"*). Usually means the
+            storage `PUT` did not complete — retry the upload, then this call.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+  /projects:
+    get:
+      tags: [File Upload]
+      summary: List the current user's projects (step 5 — retrieve/verify)
+      operationId: listProjects
+      description: |
+        Return the authenticated user's projects (most useful for rendering a
+        library/history view). Each entry includes its `input_files` and current
+        `status`, so this can also be used to poll multiple projects at once.
+
+        Paginate with `skip`/`limit`. Only the caller's own projects are ever
+        returned.
+      parameters:
+        - name: skip
+          in: query
+          required: false
+          description: Number of projects to skip (offset) for pagination.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of projects to return.
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+      responses:
+        '200':
+          description: The user's projects (possibly an empty list).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProjectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /projects/{project_id}:
+    get:
+      tags: [File Upload]
+      summary: Get a project and its uploaded files (step 5 — retrieve/verify)
+      operationId: readProject
+      description: |
+        Fetch a single project, including the list of `input_files` recorded so
+        far and the current processing `status`. Use this to confirm an upload
+        was finalised and to poll the project's status.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: The project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+    delete:
+      tags: [File Upload]
+      summary: Delete a project and all its files
+      operationId: deleteProject
+      description: |
+        Delete an entire project: every stored object under it (both the original
+        input files and any generated stems) is purged from storage, then the
+        project row is removed. Input files, processing jobs and output files
+        cascade-delete at the database level. Storage cleanup is best-effort — a
+        storage failure is logged but does not block the project deletion.
+
+        Irreversible. To remove just one file (keeping the project), use
+        `DELETE /projects/{project_id}/files/{file_id}` instead.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '204':
+          description: Project deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+  /projects/{project_id}/input-url:
+    get:
+      tags: [File Upload]
+      summary: Get a signed download URL for the original audio (step 5 — preview)
+      operationId: getInputUrl
+      description: |
+        Return a short-lived signed URL the client can use to download/preview a
+        project's **original** uploaded audio (not the separated stems).
+
+        By default the most recently uploaded file is returned; pass `file_id` to
+        target a specific input file (its `id` comes from `input_files` in the
+        project response).
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - name: file_id
+          in: query
+          required: false
+          description: |
+            Target a specific input file. Omit to get the most recently uploaded
+            file. Must belong to this project.
+          schema:
+            type: string
+            format: uuid
+        - name: expires_in
+          in: query
+          required: false
+          description: Lifetime of the signed URL, in seconds.
+          schema:
+            type: integer
+            default: 3600
+            minimum: 1
+      responses:
+        '200':
+          description: A signed, time-limited download URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InputUrlResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Project or input file not found — the project doesn't exist for this
+            user, has no uploaded files yet, or the given `file_id` isn't under it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+  /projects/{project_id}/files/{file_id}:
+    delete:
+      tags: [File Upload]
+      summary: Delete a single uploaded file
+      operationId: deleteProjectFile
+      description: |
+        Remove one uploaded file from a project — both the stored object and its
+        database record. The storage object is removed first so a failure can't
+        leave an orphaned row. The project itself is **not** deleted. Useful for
+        letting a user swap out a wrong file before processing.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - name: file_id
+          in: path
+          required: true
+          description: ID of the input file to delete (from `input_files[].id`).
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: File deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Project not found (or not owned by the user), or the file was not
+            found under the project.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT access token obtained from the auth feature (`POST /auth/login`,
+        outside this package's scope). Send it as `Authorization: Bearer <token>`
+        on every request here. All File Upload endpoints require authentication;
+        a missing/invalid/revoked token yields `401`.
+
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      description: The project's UUID.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, expired, or revoked bearer token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HTTPError' }
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          description: '`Bearer`'
+
+  schemas:
+    ProjectStatus:
+      type: string
+      description: |
+        Lifecycle of a project. Relevant to uploading:
+        `pending` → `uploading` → `queued`. `processing`/`completed`/`failed`
+        belong to the (out-of-scope) stem-separation stage.
+      enum:
+        - pending
+        - uploading
+        - queued
+        - processing
+        - completed
+        - failed
+
+    ProjectCreateRequest:
+      type: object
+      description: Payload for creating an empty project.
+      properties:
+        name:
+          type: string
+          nullable: true
+          description: 'Optional display name. Blank/omitted defaults to "Untitled project".'
+          example: "My remix session"
+
+    UploadUrlRequest:
+      type: object
+      required: [filename, content_type]
+      description: Request body for the one-shot create-project-and-presign endpoint.
+      properties:
+        filename:
+          type: string
+          description: |
+            Original filename. Sanitised server-side to a safe basename (any path
+            components are stripped); it becomes the storage object name.
+          example: "vocals.wav"
+        content_type:
+          $ref: '#/components/schemas/AudioContentType'
+        name:
+          type: string
+          nullable: true
+          description: 'Optional project name. Defaults to `filename`, else "Untitled project".'
+          example: "My remix session"
+        project_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            When set, add the file to this **existing** project (no new project,
+            no quota consumed) instead of creating one.
+          example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+    FileUploadUrlRequest:
+      type: object
+      required: [filename, content_type]
+      description: Request body for minting an upload URL against an existing project.
+      properties:
+        filename:
+          type: string
+          description: |
+            Original filename. Sanitised server-side to a safe basename (path
+            components stripped); it becomes the storage object name.
+          example: "vocals.wav"
+        content_type:
+          $ref: '#/components/schemas/AudioContentType'
+
+    AudioContentType:
+      type: string
+      description: |
+        Declared MIME type of the file being uploaded. Must be one of the
+        allowed audio types; anything else is rejected with `400`. Max file size
+        is **50 MB** (enforced by the storage bucket at PUT time).
+      enum:
+        - audio/mpeg
+        - audio/mp3
+        - audio/wav
+        - audio/x-wav
+        - audio/wave
+        - audio/flac
+        - audio/x-flac
+        - audio/mp4
+        - audio/aac
+        - audio/ogg
+        - audio/webm
+      example: "audio/wav"
+
+    UploadUrlResponse:
+      type: object
+      description: |
+        A one-time presigned URL to upload the file directly to Supabase Storage.
+        See [Uploading the bytes to storage](#section/Uploading-the-bytes-to-storage)
+        for how to perform the `PUT`.
+      required: [project_id, storage_key, url, token]
+      properties:
+        project_id:
+          type: string
+          format: uuid
+          description: The project the file will belong to.
+        storage_key:
+          type: string
+          description: |
+            Object path within the input bucket
+            (`<user_id>/<project_id>/<filename>`). Informational; the client does
+            not need to construct it.
+          example: "3fa85f64-.../a1b2.../vocals.wav"
+        url:
+          type: string
+          description: |
+            Supabase signed upload URL to `PUT` the bytes to. **May be relative**
+            (e.g. `/object/upload/sign/...`); if so, prefix with
+            `<SUPABASE_URL>/storage/v1` to make it absolute.
+          example: "/object/upload/sign/audio-inputs/3fa85f64-.../vocals.wav?token=..."
+        token:
+          type: string
+          description: |
+            Single-use upload token (also embedded in `url`). Expires (~2h by
+            default). No `Authorization` header is needed for the storage PUT.
+
+    ProjectFileResponse:
+      type: object
+      description: Metadata for one uploaded input file, recorded at finalisation.
+      required:
+        [id, original_filename, storage_key, file_size_bytes, content_type, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: File ID — pass to `input-url`/`DELETE` to target this file.
+        original_filename:
+          type: string
+          example: "vocals.wav"
+        storage_key:
+          type: string
+          example: "3fa85f64-.../a1b2.../vocals.wav"
+        file_size_bytes:
+          type: integer
+          description: Actual stored size, read back from storage.
+          example: 5242880
+        content_type:
+          type: string
+          example: "audio/wav"
+        created_at:
+          type: string
+          format: date-time
+
+    ProjectResponse:
+      type: object
+      description: A project and its uploaded input files.
+      required: [id, user_id, name, status, input_files, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "My remix session"
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        input_files:
+          type: array
+          description: Files uploaded to this project so far (empty until finalised).
+          items:
+            $ref: '#/components/schemas/ProjectFileResponse'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    InputUrlResponse:
+      type: object
+      required: [url, expires_in]
+      properties:
+        url:
+          type: string
+          description: Short-lived signed URL to download/preview the original audio.
+        expires_in:
+          type: integer
+          description: Lifetime of `url`, in seconds (echoes the request).
+          example: 3600
+
+    HTTPError:
+      type: object
+      description: Standard FastAPI error envelope.
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: Human-readable error message.
+          example: "Project not found"

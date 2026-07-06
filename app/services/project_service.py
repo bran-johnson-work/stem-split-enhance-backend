@@ -3,7 +3,6 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import UploadFile
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -78,98 +77,106 @@ class ProjectService:
                 f"Monthly project limit reached ({limit}). Upgrade your plan to create more."
             )
 
-    async def create_and_upload(
+    async def create_project(
+        self, db: AsyncSession, *, user_id: uuid.UUID, name: str
+    ) -> Project:
+        """Create an empty project (no file yet), enforcing the monthly quota.
+
+        A project is the metered unit, so the quota check lives here — the
+        subsequent presigned upload(s) into this project are free. The project
+        starts ``PENDING`` and moves to ``UPLOADING``/``QUEUED`` as files arrive.
+        Raises ``ValueError`` when the quota is exceeded.
+        """
+        await self._enforce_project_quota(db, user_id)
+        project = await self.repository.create(
+            db,
+            ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.PENDING),
+        )
+        await db.commit()
+        await db.refresh(project, attribute_names=["input_files"])
+        return project
+
+    async def create_file_upload_url(
         self,
         db: AsyncSession,
         *,
+        project_id: uuid.UUID,
         user_id: uuid.UUID,
-        name: str,
-        file: UploadFile,
-        project_id: uuid.UUID | None = None,
-    ) -> Project | None:
-        """Validate an uploaded audio file, store it in Supabase, and record it.
+        filename: str,
+        content_type: str,
+    ) -> tuple[Project, dict[str, str]] | None:
+        """Mint a presigned URL to upload a file into an *existing* project.
 
-        When ``project_id`` is given the file is added to that existing project
-        (one-to-many); otherwise a new project is created after a monthly-quota
-        check. Returns ``None`` if ``project_id`` is supplied but not found for
-        the user. Raises ``ValueError`` on invalid input (empty file,
-        unsupported type, too large, or quota exceeded) so the endpoint can
-        translate it into a 4xx response.
+        The project must already exist and belong to the user (create it first
+        via :meth:`create_project`); no quota is consumed here. Returns ``None``
+        when the project isn't found. Raises ``ValueError`` on an unsupported
+        content type. Delegates to :meth:`create_upload_url` with the project
+        pinned, keeping a single presign code path.
         """
-        settings = get_settings()
+        return await self.create_upload_url(
+            db,
+            user_id=user_id,
+            name="",  # ignored: the project already exists, so name isn't used
+            filename=filename,
+            content_type=content_type,
+            project_id=project_id,
+        )
 
-        content_type = (file.content_type or "").lower()
-        if content_type not in settings.allowed_audio_content_type_set:
-            raise ValueError(f"Unsupported audio content type: {file.content_type or 'unknown'}")
+    async def delete_input_file(
+        self,
+        db: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        user_id: uuid.UUID,
+        file_id: uuid.UUID,
+    ) -> bool | None:
+        """Delete one uploaded file from a project (storage object + DB row).
 
-        data = await file.read()
-        if not data:
-            raise ValueError("Uploaded file is empty")
-        if len(data) > settings.max_upload_size_bytes:
-            raise ValueError(
-                f"File exceeds the maximum size of {settings.max_upload_size_bytes} bytes"
-            )
+        Returns ``True`` on success, ``None`` when the project isn't found for
+        the user, and ``False`` when the file isn't found under the project.
+        Storage is removed before the row so a failure can't orphan the DB.
+        """
+        project = await self.repository.get_for_user(db, project_id, user_id)
+        if project is None:
+            return None
 
-        original_filename = _sanitize_filename(file.filename)
+        target = await self.file_repository.get_for_project(
+            db, project_id=project_id, file_id=file_id
+        )
+        if target is None:
+            return False
 
-        if project_id is not None:
-            project = await self.repository.get_for_user(db, project_id, user_id)
-            if project is None:
-                return None
-            reuse = True
-            project = await self.repository.update(
-                db, project, {"status": ProjectStatus.UPLOADING}
-            )
-        else:
-            await self._enforce_project_quota(db, user_id)
-            reuse = False
-            # Create the project first so the storage key can be namespaced by its id.
-            project = await self.repository.create(
-                db,
-                ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.UPLOADING),
-            )
+        await run_in_threadpool(
+            storage.delete_file, storage.BUCKET_INPUTS, target.storage_key
+        )
+        await db.delete(target)
+        await db.commit()
+        return True
 
-        storage_key = f"{user_id}/{project.id}/{original_filename}"
+    async def delete_project(
+        self, db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID
+    ) -> bool | None:
+        """Delete a project entirely: its storage objects and the DB row (cascade).
 
-        try:
-            # The Supabase client is synchronous; keep the event loop responsive.
-            await run_in_threadpool(
-                storage.upload_file,
-                storage.BUCKET_INPUTS,
-                storage_key,
-                data,
-                content_type,
-            )
+        Purges everything under the project's storage prefix in both the input
+        and stem buckets, then deletes the project (input files, jobs and output
+        files cascade at the DB level). Returns ``True`` on success or ``None``
+        when the project isn't found for the user.
+        """
+        project = await self.repository.get_for_user(db, project_id, user_id)
+        if project is None:
+            return None
 
-            # Re-uploading to an existing project may hit an existing key, so upsert.
-            record = (
-                self.file_repository.upsert_for_project
-                if reuse
-                else self.file_repository.create_for_project
-            )
-            await record(
-                db,
-                project_id=project.id,
-                original_filename=original_filename,
-                storage_key=storage_key,
-                file_size_bytes=len(data),
-                content_type=content_type,
-            )
-            project = await self.repository.update(db, project, {"status": ProjectStatus.QUEUED})
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            # Best-effort cleanup so we don't leave an orphaned storage object.
+        prefix = f"{user_id}/{project.id}"
+        for bucket in (storage.BUCKET_INPUTS, storage.BUCKET_STEMS):
             try:
-                await run_in_threadpool(
-                    storage.delete_file, storage.BUCKET_INPUTS, storage_key
-                )
-            except Exception:  # pragma: no cover - cleanup is best-effort
-                logger.warning("Failed to clean up orphaned upload at %s", storage_key)
-            raise
+                await run_in_threadpool(storage.delete_prefix, bucket, prefix)
+            except Exception:  # pragma: no cover - storage cleanup is best-effort
+                logger.warning("Failed to purge storage prefix %s in %s", prefix, bucket)
 
-        await db.refresh(project, attribute_names=["input_files"])
-        return project
+        await db.delete(project)
+        await db.commit()
+        return True
 
     async def create_upload_url(
         self,

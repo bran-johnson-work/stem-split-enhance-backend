@@ -11,18 +11,6 @@ from app.services import project_service as project_service_module
 from app.services.project_service import ProjectService
 
 
-class StubUpload:
-    """Minimal stand-in for Starlette's UploadFile."""
-
-    def __init__(self, data: bytes, content_type: str, filename: str = "song.wav") -> None:
-        self._data = data
-        self.content_type = content_type
-        self.filename = filename
-
-    async def read(self) -> bytes:
-        return self._data
-
-
 @pytest.fixture
 def service() -> ProjectService:
     svc = ProjectService()
@@ -43,63 +31,6 @@ def _project(user_id: uuid.UUID) -> Project:
         created_at=now,
         updated_at=now,
     )
-
-
-async def test_create_and_upload_success(service, fake_db, monkeypatch):
-    user_id = uuid.uuid4()
-    project = _project(user_id)
-    service.repository.create.return_value = project
-    service.repository.update.return_value = project
-
-    upload_mock = MagicMock(return_value="key")
-    monkeypatch.setattr(project_service_module.storage, "upload_file", upload_mock)
-
-    result = await service.create_and_upload(
-        fake_db, user_id=user_id, name="Song", file=StubUpload(b"audio-bytes", "audio/wav")
-    )
-
-    assert result is project
-    # Object stored under a user/project-namespaced key.
-    key = upload_mock.call_args.args[1]
-    assert key == f"{user_id}/{project.id}/song.wav"
-    service.file_repository.create_for_project.assert_awaited_once()
-    service.repository.update.assert_awaited_once()
-    assert service.repository.update.call_args.args[2] == {"status": ProjectStatus.QUEUED}
-    fake_db.commit.assert_awaited_once()
-
-
-async def test_rejects_unsupported_content_type(service, fake_db):
-    with pytest.raises(ValueError, match="Unsupported audio content type"):
-        await service.create_and_upload(
-            fake_db,
-            user_id=uuid.uuid4(),
-            name="Song",
-            file=StubUpload(b"data", "application/zip"),
-        )
-    service.repository.create.assert_not_called()
-
-
-async def test_rejects_empty_file(service, fake_db):
-    with pytest.raises(ValueError, match="empty"):
-        await service.create_and_upload(
-            fake_db, user_id=uuid.uuid4(), name="Song", file=StubUpload(b"", "audio/wav")
-        )
-    service.repository.create.assert_not_called()
-
-
-async def test_rejects_file_over_limit(service, fake_db, monkeypatch):
-    from app.core.config import get_settings
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "max_upload_size_bytes", 4, raising=False)
-    with pytest.raises(ValueError, match="maximum size"):
-        await service.create_and_upload(
-            fake_db,
-            user_id=uuid.uuid4(),
-            name="Song",
-            file=StubUpload(b"too-many-bytes", "audio/wav"),
-        )
-    service.repository.create.assert_not_called()
 
 
 async def test_create_upload_url_success(service, fake_db, monkeypatch):
@@ -189,69 +120,138 @@ async def test_complete_upload_no_object_raises(service, fake_db, monkeypatch):
     service.file_repository.upsert_for_project.assert_not_called()
 
 
-async def test_cleans_up_storage_on_db_failure(service, fake_db, monkeypatch):
+# --- create empty project --------------------------------------------------
+
+
+async def test_create_project_enforces_quota_then_creates(service, fake_db):
     user_id = uuid.uuid4()
     project = _project(user_id)
     service.repository.create.return_value = project
-    service.file_repository.create_for_project.side_effect = RuntimeError("db down")
 
-    upload_mock = MagicMock(return_value="key")
-    delete_mock = MagicMock()
-    monkeypatch.setattr(project_service_module.storage, "upload_file", upload_mock)
-    monkeypatch.setattr(project_service_module.storage, "delete_file", delete_mock)
+    result = await service.create_project(fake_db, user_id=user_id, name="Song")
 
-    with pytest.raises(RuntimeError, match="db down"):
-        await service.create_and_upload(
-            fake_db, user_id=user_id, name="Song", file=StubUpload(b"audio", "audio/wav")
-        )
-
-    fake_db.rollback.assert_awaited_once()
-    delete_mock.assert_called_once()  # orphaned object removed
+    assert result is project
+    service._enforce_project_quota.assert_awaited_once()
+    # Created as an empty PENDING project (no file yet).
+    created = service.repository.create.call_args.args[1]
+    assert created.status is ProjectStatus.PENDING
+    fake_db.commit.assert_awaited_once()
 
 
-# --- one-to-many re-upload -------------------------------------------------
+async def test_create_project_blocked_by_quota_does_not_create(service, fake_db):
+    service._enforce_project_quota.side_effect = ValueError("Monthly project limit reached")
+    with pytest.raises(ValueError, match="limit reached"):
+        await service.create_project(fake_db, user_id=uuid.uuid4(), name="Song")
+    service.repository.create.assert_not_called()
 
 
-async def test_reupload_to_existing_project_appends(service, fake_db, monkeypatch):
+async def test_create_file_upload_url_delegates_with_project(service, fake_db, monkeypatch):
     user_id = uuid.uuid4()
     project = _project(user_id)
     service.repository.get_for_user.return_value = project
     service.repository.update.return_value = project
 
-    upload_mock = MagicMock(return_value="key")
-    monkeypatch.setattr(project_service_module.storage, "upload_file", upload_mock)
+    signed_mock = MagicMock(return_value={"url": "https://up.example", "token": "tok", "path": "p"})
+    monkeypatch.setattr(project_service_module.storage, "create_signed_upload_url", signed_mock)
 
-    result = await service.create_and_upload(
+    result = await service.create_file_upload_url(
         fake_db,
-        user_id=user_id,
-        name="Song",
-        file=StubUpload(b"more-audio", "audio/wav"),
         project_id=project.id,
+        user_id=user_id,
+        filename="song.wav",
+        content_type="audio/wav",
     )
 
-    assert result is project
-    service.repository.get_for_user.assert_awaited_once()
-    # Existing project → upsert (idempotent on repeat key), never a new project.
-    service.file_repository.upsert_for_project.assert_awaited_once()
-    service.file_repository.create_for_project.assert_not_called()
-    service.repository.create.assert_not_called()
-    # Re-uploading to an existing project must not consume monthly quota.
+    assert result is not None
+    result_project, signed = result
+    assert result_project is project
+    assert signed["storage_key"] == f"{user_id}/{project.id}/song.wav"
+    # Existing project → no quota consumed, no new project created.
     service._enforce_project_quota.assert_not_called()
+    service.repository.create.assert_not_called()
+
+
+async def test_create_file_upload_url_missing_project_returns_none(service, fake_db):
+    service.repository.get_for_user.return_value = None
+    result = await service.create_file_upload_url(
+        fake_db,
+        project_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        filename="song.wav",
+        content_type="audio/wav",
+    )
+    assert result is None
+
+
+# --- deletion --------------------------------------------------------------
+
+
+async def test_delete_input_file_removes_storage_and_row(service, fake_db, monkeypatch):
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    service.repository.get_for_user.return_value = project
+    target = SimpleNamespace(id=uuid.uuid4(), storage_key=f"{user_id}/{project.id}/song.wav")
+    service.file_repository.get_for_project.return_value = target
+
+    delete_mock = MagicMock()
+    monkeypatch.setattr(project_service_module.storage, "delete_file", delete_mock)
+
+    result = await service.delete_input_file(
+        fake_db, project_id=project.id, user_id=user_id, file_id=target.id
+    )
+
+    assert result is True
+    delete_mock.assert_called_once()
+    assert delete_mock.call_args.args[1] == target.storage_key
+    fake_db.delete.assert_awaited_once_with(target)
     fake_db.commit.assert_awaited_once()
 
 
-async def test_reupload_missing_project_returns_none(service, fake_db):
+async def test_delete_input_file_missing_project_returns_none(service, fake_db):
     service.repository.get_for_user.return_value = None
-    result = await service.create_and_upload(
-        fake_db,
-        user_id=uuid.uuid4(),
-        name="Song",
-        file=StubUpload(b"audio", "audio/wav"),
-        project_id=uuid.uuid4(),
+    result = await service.delete_input_file(
+        fake_db, project_id=uuid.uuid4(), user_id=uuid.uuid4(), file_id=uuid.uuid4()
     )
     assert result is None
-    service.file_repository.create_for_project.assert_not_called()
-    service.file_repository.upsert_for_project.assert_not_called()
+    service.file_repository.get_for_project.assert_not_called()
+
+
+async def test_delete_input_file_missing_file_returns_false(service, fake_db):
+    project = _project(uuid.uuid4())
+    service.repository.get_for_user.return_value = project
+    service.file_repository.get_for_project.return_value = None
+    result = await service.delete_input_file(
+        fake_db, project_id=project.id, user_id=project.user_id, file_id=uuid.uuid4()
+    )
+    assert result is False
+    fake_db.delete.assert_not_called()
+
+
+async def test_delete_project_purges_storage_and_row(service, fake_db, monkeypatch):
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    service.repository.get_for_user.return_value = project
+
+    prefix_mock = MagicMock()
+    monkeypatch.setattr(project_service_module.storage, "delete_prefix", prefix_mock)
+
+    result = await service.delete_project(fake_db, project_id=project.id, user_id=user_id)
+
+    assert result is True
+    # Purged both the input and stem buckets under the project prefix.
+    assert prefix_mock.call_count == 2
+    assert all(call.args[1] == f"{user_id}/{project.id}" for call in prefix_mock.call_args_list)
+    fake_db.delete.assert_awaited_once_with(project)
+    fake_db.commit.assert_awaited_once()
+
+
+async def test_delete_project_missing_returns_none(service, fake_db):
+    service.repository.get_for_user.return_value = None
+    result = await service.delete_project(
+        fake_db, project_id=uuid.uuid4(), user_id=uuid.uuid4()
+    )
+    assert result is None
+    fake_db.delete.assert_not_called()
 
 
 # --- monthly quota enforcement ---------------------------------------------

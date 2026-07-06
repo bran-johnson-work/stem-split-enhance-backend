@@ -12,6 +12,12 @@ class ProjectCreate(BaseModel):
     status: ProjectStatus = ProjectStatus.PENDING
 
 
+class ProjectCreateRequest(BaseModel):
+    """Client payload for creating an empty project (before any file is uploaded)."""
+
+    name: str | None = None
+
+
 class ProjectUpdate(BaseModel):
     name: str | None = None
     status: ProjectStatus | None = None
@@ -53,6 +59,13 @@ class UploadUrlRequest(BaseModel):
     name: str | None = None
     # When set, add the file to an existing project instead of creating a new one.
     project_id: uuid.UUID | None = None
+
+
+class FileUploadUrlRequest(BaseModel):
+    """Client's request for a presigned URL to add a file to an existing project."""
+
+    filename: str
+    content_type: str
 
 
 class UploadUrlResponse(BaseModel):

@@ -11,6 +11,18 @@ from app.schemas.project import ProjectCreate, ProjectUpdate
 class ProjectFileRepository(BaseRepository[ProjectFile, ProjectCreate, ProjectUpdate]):
     """Data access for the audio files uploaded to a project (one-to-many)."""
 
+    async def get_for_project(
+        self, db: AsyncSession, *, project_id: uuid.UUID, file_id: uuid.UUID
+    ) -> ProjectFile | None:
+        """Get a single file by id, scoped to its owning project."""
+        result = await db.execute(
+            select(ProjectFile).where(
+                ProjectFile.id == file_id,
+                ProjectFile.project_id == project_id,
+            )
+        )
+        return result.scalars().first()
+
     async def create_for_project(
         self,
         db: AsyncSession,

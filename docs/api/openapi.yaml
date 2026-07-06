@@ -1,0 +1,1238 @@
+openapi: 3.0.3
+
+info:
+  title: AI Audio Stem API
+  version: "1.0.0"
+  description: |
+    Complete API reference for the **AI Audio Stem Separation** backend — the
+    single document the frontend integrates against. It covers every public
+    endpoint across three feature areas:
+
+    - **Auth** — registration, login (JWT), logout, and email verification.
+    - **Users** — read/update/delete the authenticated user's profile.
+    - **Projects & File Upload** — create projects and upload audio via
+      presigned, direct-to-storage URLs, then finalise for processing.
+
+    > For an isolated, feature-scoped package covering only the upload flow, see
+    > `file-upload.openapi.yaml`. This document is the superset.
+
+    ## Authentication
+
+    All endpoints except registration, login, email-verification, and health
+    require a **JWT bearer token**. Obtain one from `POST /api/v1/auth/login`
+    and send it on every protected request:
+
+    ```
+    Authorization: Bearer <access_token>
+    ```
+
+    Tokens expire (default 30 min) and can be revoked by `POST /api/v1/auth/logout`.
+    A missing, invalid, expired, or revoked token yields `401`.
+
+    ## Error format
+
+    Errors use FastAPI's standard envelope, `{ "detail": ... }`. For most errors
+    `detail` is a human-readable string; for request-validation failures (`422`)
+    it is a structured list (see `HTTPValidationError`).
+
+    ## The upload flow (presigned, direct-to-storage)
+
+    Audio bytes are **never** streamed through this API. The API mints a one-time
+    presigned URL pointing at Supabase Storage; the client `PUT`s the file to
+    that URL, then calls `upload-complete` to finalise. Recommended sequence:
+
+    1. `POST /api/v1/projects` — create a project (consumes monthly quota).
+    2. `POST /api/v1/projects/{project_id}/files/upload-url` — mint a presigned URL.
+    3. `PUT` the raw bytes to the returned `url` (direct to Supabase, not this API).
+    4. `POST /api/v1/projects/{project_id}/upload-complete` — verify & queue.
+    5. `GET /api/v1/projects/{project_id}` / `.../input-url` — retrieve/preview.
+
+    A one-shot shortcut, `POST /api/v1/projects/upload-url`, creates the project
+    **and** mints the URL in one call for the simple single-file case.
+
+    ### Uploading the bytes to storage
+    - The API returns Supabase's `url` (may be **relative**, e.g.
+      `/object/upload/sign/...`) plus a single-use `token`.
+    - If `url` is relative, prefix it with `<SUPABASE_URL>/storage/v1` to make it
+      absolute, then `PUT` the raw file bytes.
+    - Set the `Content-Type` header to the same value you declared when requesting
+      the URL. No `Authorization` header is needed for the storage `PUT` (the
+      token is embedded in the signed `url`).
+    - The token is single-use and expires (~2h). The bucket enforces the max file
+      size (**50 MB**) and allowed MIME types at `PUT` time.
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: https://api.example.com
+    description: Production (replace with the real host)
+
+tags:
+  - name: Auth
+    description: Registration, login, logout, and email verification.
+  - name: Users
+    description: Read and manage the authenticated user's profile.
+  - name: Projects & File Upload
+    description: Create projects and upload audio files via presigned URLs.
+  - name: Health
+    description: Service liveness.
+
+# Applied to every operation unless overridden with `security: []`.
+security:
+  - bearerAuth: []
+
+paths:
+  # ---------------------------------------------------------------------------
+  # AUTH
+  # ---------------------------------------------------------------------------
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      operationId: registerUser
+      security: []
+      description: |
+        Create a new user account and send a verification email in the
+        background (email delivery never blocks or fails registration).
+
+        The account starts **unverified** (`is_verified: false`). If the server
+        requires email verification, the user must confirm their email (via
+        `POST /auth/verify-email/confirm`) before they can log in.
+
+        For privacy, failures return a **generic** `400` (they never reveal
+        whether the email is already registered).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+            examples:
+              default:
+                value:
+                  email: "user@example.com"
+                  password: "S3curePassw0rd!"
+                  full_name: "Jane Doe"
+      responses:
+        '201':
+          description: User registered. Returns the created user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          description: |
+            Registration could not be completed (generic — e.g. the email is
+            already registered). Message: *"Unable to register with the provided
+            details."*
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in and obtain an access token
+      operationId: login
+      security: []
+      description: |
+        OAuth2 "password" grant. Submit credentials as
+        **`application/x-www-form-urlencoded`** (not JSON): the `username` field
+        is the user's email and `password` is their password.
+
+        On success returns a JWT `access_token` (send it as
+        `Authorization: Bearer <token>` on protected endpoints).
+
+        Login is rate-limited per client-IP + email; too many failed attempts
+        return `429`. Invalid credentials and inactive accounts collapse into a
+        single generic `401` (no account enumeration). If the server requires
+        email verification and the account is unverified, login returns `403`.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginForm'
+            examples:
+              default:
+                value:
+                  username: "user@example.com"
+                  password: "S3curePassw0rd!"
+      responses:
+        '200':
+          description: Authenticated. Returns the bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Token'
+        '401':
+          description: |
+            Invalid credentials or inactive account (deliberately
+            indistinguishable). Message: *"Incorrect email or password"*.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+          headers:
+            WWW-Authenticate:
+              schema: { type: string }
+              description: '`Bearer`'
+        '403':
+          description: |
+            Email not verified (only shown to someone who supplied the correct
+            password). Message: *"Please verify your email address before logging
+            in."*
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          description: |
+            Too many login attempts for this IP + email. Message: *"Too many
+            login attempts. Please try again later."*
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out (revoke the current token)
+      operationId: logout
+      description: |
+        Revoke the presented bearer token by adding its `jti` to the server-side
+        denylist; subsequent requests with the same token are rejected with
+        `401`. Idempotent from the client's perspective — always returns a
+        success message when a valid token is presented.
+      responses:
+        '200':
+          description: Token revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              examples:
+                default:
+                  value: { detail: "Successfully logged out" }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/verify-email/request:
+    post:
+      tags: [Auth]
+      summary: Request (resend) a verification email
+      operationId: requestEmailVerification
+      security: []
+      description: |
+        (Re)send an email-verification link to the given address. Always returns
+        the same generic acknowledgement regardless of whether an account exists
+        or is already verified, so it can't be used to probe for accounts. An
+        email is only actually sent to a matching, not-yet-verified user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerificationRequest'
+            examples:
+              default:
+                value: { email: "user@example.com" }
+      responses:
+        '200':
+          description: Generic acknowledgement (email sent only if eligible).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              examples:
+                default:
+                  value:
+                    detail: "If an account exists for that address, a verification email has been sent."
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/auth/verify-email/confirm:
+    post:
+      tags: [Auth]
+      summary: Confirm an email address
+      operationId: confirmEmailVerification
+      security: []
+      description: |
+        Confirm ownership of an email by presenting the `token` from the
+        verification link. On success the account becomes verified and can log
+        in. An invalid or expired token returns `400`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+            examples:
+              default:
+                value: { token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." }
+      responses:
+        '200':
+          description: Email verified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              examples:
+                default:
+                  value: { detail: "Email verified successfully." }
+        '400':
+          description: |
+            Invalid or expired verification token. Message: *"Invalid or expired
+            verification token."*
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # ---------------------------------------------------------------------------
+  # USERS
+  # ---------------------------------------------------------------------------
+  /api/v1/users/me:
+    get:
+      tags: [Users]
+      summary: Get the current user
+      operationId: readCurrentUser
+      description: Return the profile of the currently authenticated user.
+      responses:
+        '200':
+          description: The authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/users/{user_id}:
+    get:
+      tags: [Users]
+      summary: Get a user by ID
+      operationId: readUser
+      description: Fetch a user by their UUID. Requires authentication.
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'User not found. Message: *"User not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    patch:
+      tags: [Users]
+      summary: Update a user profile
+      operationId: updateUser
+      description: |
+        Update the profile of a user. A user may only update **their own**
+        account — updating anyone else returns `403`. All fields are optional;
+        only the fields you send are changed. Sending `password` re-hashes and
+        replaces the stored password.
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+            examples:
+              rename:
+                summary: Change display name
+                value: { full_name: "Jane Q. Doe" }
+              changePassword:
+                summary: Change password
+                value: { password: "N3wPassw0rd!" }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Attempted to update an account other than your own. Message: *"Not
+            authorized to update this user"*.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '404':
+          description: 'User not found. Message: *"User not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Users]
+      summary: Delete a user
+      operationId: deleteUser
+      description: |
+        Delete a user account. A user may only delete **their own** account —
+        deleting anyone else returns `403`. Deleting a user cascades to their
+        projects and associated storage/records at the database level.
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '204':
+          description: User deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Attempted to delete an account other than your own. Message: *"Not
+            authorized to delete this user"*.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '404':
+          description: 'User not found. Message: *"User not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # ---------------------------------------------------------------------------
+  # PROJECTS & FILE UPLOAD
+  # ---------------------------------------------------------------------------
+  /api/v1/projects:
+    post:
+      tags: [Projects & File Upload]
+      summary: Create an empty project (upload step 1)
+      operationId: createProject
+      description: |
+        Create an empty project to hold uploaded file(s). **This is the metered
+        unit** — it consumes one of the plan's monthly projects; the subsequent
+        presigned uploads into it are free.
+
+        The project is created with status `pending`. Requesting an upload URL
+        moves it to `uploading`, and finalising moves it to `queued`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreateRequest'
+            examples:
+              named:
+                summary: With an explicit name
+                value: { name: "My remix session" }
+              unnamed:
+                summary: Omit name (defaults to "Untitled project")
+                value: {}
+      responses:
+        '201':
+          description: Project created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '400':
+          description: |
+            Monthly project quota exceeded. Message: *"Monthly project limit
+            reached (N). Upgrade your plan to create more."*
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    get:
+      tags: [Projects & File Upload]
+      summary: List the current user's projects
+      operationId: listProjects
+      description: |
+        Return the authenticated user's projects (for a library/history view).
+        Each entry includes its `input_files` and current `status`. Only the
+        caller's own projects are returned. Paginate with `skip`/`limit`.
+      parameters:
+        - name: skip
+          in: query
+          required: false
+          description: Number of projects to skip (offset) for pagination.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of projects to return.
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+      responses:
+        '200':
+          description: The user's projects (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProjectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/upload-url:
+    post:
+      tags: [Projects & File Upload]
+      summary: Create a project AND mint an upload URL (one-shot shortcut)
+      operationId: createProjectUploadUrl
+      description: |
+        Convenience endpoint for the single-file case: creates a new project
+        **and** returns a presigned upload URL in one call, so you can skip the
+        separate `POST /api/v1/projects` step.
+
+        Consumes one monthly project quota unit — **unless** `project_id` is
+        supplied, in which case it targets that existing project and consumes no
+        quota. After calling this, `PUT` the bytes to the returned `url`, then
+        call `POST /api/v1/projects/{project_id}/upload-complete`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadUrlRequest'
+            examples:
+              newProject:
+                summary: Create a new project and presign
+                value:
+                  filename: "vocals.wav"
+                  content_type: "audio/wav"
+                  name: "My remix session"
+              existingProject:
+                summary: Add a file to an existing project (no quota consumed)
+                value:
+                  filename: "drums.mp3"
+                  content_type: "audio/mpeg"
+                  project_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+      responses:
+        '201':
+          description: Project ready and presigned URL minted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadUrlResponse'
+        '400':
+          description: Unsupported audio content type, or monthly quota exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '`project_id` was supplied but no such project exists for this user.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/files/upload-url:
+    post:
+      tags: [Projects & File Upload]
+      summary: Mint a presigned upload URL for an existing project (upload step 2)
+      operationId: createFileUploadUrl
+      description: |
+        Request a one-time presigned URL to upload a file into an **existing**
+        project. Call once per file — repeat for multi-file projects. No quota is
+        consumed here (the project already accounts for it).
+
+        Requesting a URL moves the project to `uploading`. After calling this,
+        `PUT` the bytes to the returned `url`, then finalise with
+        `POST /api/v1/projects/{project_id}/upload-complete`.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileUploadUrlRequest'
+            examples:
+              wav:
+                value: { filename: "vocals.wav", content_type: "audio/wav" }
+      responses:
+        '201':
+          description: Presigned URL minted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadUrlResponse'
+        '400':
+          description: |
+            Unsupported audio content type. The declared `content_type` must be
+            one of the allowed audio types (see `AudioContentType`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/upload-complete:
+    post:
+      tags: [Projects & File Upload]
+      summary: Finalise the upload (upload step 4)
+      operationId: completeUpload
+      description: |
+        Call after the storage `PUT` succeeds. The API lists the project's
+        storage prefix, **verifies the uploaded object(s) actually landed**
+        (never trusting the client), records each file's real size and content
+        type under the project, and — if not already — moves the project to
+        `queued` so the stem engine can pick it up.
+
+        **Idempotent:** safe to retry. Re-recording an already-known object
+        refreshes its metadata in place; if nothing new is in storage but files
+        are already recorded, the current project is returned unchanged.
+
+        No request body is required — the project is identified by the path.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: |
+            Upload finalised. Returns the project with its populated
+            `input_files` and status advanced to `queued`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '400':
+          description: |
+            No uploaded file was found under the project's storage prefix
+            (*"No uploaded file found for this project"*). Usually means the
+            storage `PUT` did not complete — retry the upload, then this call.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}:
+    get:
+      tags: [Projects & File Upload]
+      summary: Get a project and its uploaded files (upload step 5 — retrieve/verify)
+      operationId: readProject
+      description: |
+        Fetch a single project, including the list of `input_files` recorded so
+        far and the current processing `status`. Use this to confirm an upload
+        was finalised and to poll the project's status.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: The project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Projects & File Upload]
+      summary: Delete a project and all its files
+      operationId: deleteProject
+      description: |
+        Delete an entire project: every stored object under it (original input
+        files and any generated stems) is purged from storage, then the project
+        row is removed. Input files, processing jobs and output files
+        cascade-delete at the database level. Storage cleanup is best-effort — a
+        storage failure is logged but does not block the deletion.
+
+        Irreversible. To remove just one file (keeping the project), use
+        `DELETE /api/v1/projects/{project_id}/files/{file_id}` instead.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '204':
+          description: Project deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Project not found (or not owned by the authenticated user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/input-url:
+    get:
+      tags: [Projects & File Upload]
+      summary: Get a signed download URL for the original audio (upload step 5 — preview)
+      operationId: getInputUrl
+      description: |
+        Return a short-lived signed URL the client can use to download/preview a
+        project's **original** uploaded audio (not the separated stems).
+
+        By default the most recently uploaded file is returned; pass `file_id` to
+        target a specific input file (its `id` comes from `input_files` in the
+        project response).
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - name: file_id
+          in: query
+          required: false
+          description: |
+            Target a specific input file. Omit to get the most recently uploaded
+            file. Must belong to this project.
+          schema:
+            type: string
+            format: uuid
+        - name: expires_in
+          in: query
+          required: false
+          description: Lifetime of the signed URL, in seconds.
+          schema:
+            type: integer
+            default: 3600
+            minimum: 1
+      responses:
+        '200':
+          description: A signed, time-limited download URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InputUrlResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Project or input file not found — the project doesn't exist for this
+            user, has no uploaded files yet, or the given `file_id` isn't under it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/files/{file_id}:
+    delete:
+      tags: [Projects & File Upload]
+      summary: Delete a single uploaded file
+      operationId: deleteProjectFile
+      description: |
+        Remove one uploaded file from a project — both the stored object and its
+        database record. The storage object is removed first so a failure can't
+        leave an orphaned row. The project itself is **not** deleted. Useful for
+        letting a user swap out a wrong file before processing.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - name: file_id
+          in: path
+          required: true
+          description: ID of the input file to delete (from `input_files[].id`).
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: File deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Project not found (or not owned by the user), or the file was not
+            found under the project.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # ---------------------------------------------------------------------------
+  # HEALTH
+  # ---------------------------------------------------------------------------
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      operationId: healthCheck
+      security: []
+      description: Simple liveness probe. Requires no authentication.
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                default:
+                  value: { status: "ok", env: "local" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT access token from `POST /api/v1/auth/login`. Send it as
+        `Authorization: Bearer <token>`. Expired or revoked (logged-out) tokens
+        yield `401`.
+
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      description: The project's UUID.
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      description: The user's UUID.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, expired, or revoked bearer token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HTTPError' }
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          description: '`Bearer`'
+    ValidationError:
+      description: Request validation failed (malformed body, params, or types).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HTTPValidationError' }
+
+  schemas:
+    # ---- Auth / Users ------------------------------------------------------
+    UserCreate:
+      type: object
+      required: [email, password]
+      description: Registration payload.
+      properties:
+        email:
+          type: string
+          format: email
+          description: The new user's email address (must be unique).
+          example: "user@example.com"
+        password:
+          type: string
+          format: password
+          description: Plaintext password (hashed server-side with PBKDF2-HMAC-SHA256).
+          example: "S3curePassw0rd!"
+        full_name:
+          type: string
+          nullable: true
+          description: Optional display name.
+          example: "Jane Doe"
+
+    UserUpdate:
+      type: object
+      description: |
+        Partial update of a user. All fields optional; only the fields present
+        are changed. Can only be applied to the caller's own account.
+      properties:
+        email:
+          type: string
+          format: email
+          nullable: true
+          example: "new@example.com"
+        password:
+          type: string
+          format: password
+          nullable: true
+          description: New password (re-hashed when supplied).
+        full_name:
+          type: string
+          nullable: true
+          example: "Jane Q. Doe"
+        is_active:
+          type: boolean
+          nullable: true
+          description: Administrative flag — whether the account is enabled.
+        is_verified:
+          type: boolean
+          nullable: true
+          description: Administrative flag — whether the email is verified.
+
+    UserResponse:
+      type: object
+      description: A user profile as returned by the API (never includes the password).
+      required: [id, email, is_active, is_verified, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        full_name:
+          type: string
+          nullable: true
+          example: "Jane Doe"
+        is_active:
+          type: boolean
+          example: true
+        is_verified:
+          type: boolean
+          example: false
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    LoginForm:
+      type: object
+      description: |
+        OAuth2 password-grant form (`application/x-www-form-urlencoded`).
+        `username` is the user's email.
+      required: [username, password]
+      properties:
+        grant_type:
+          type: string
+          nullable: true
+          description: OAuth2 grant type. Optional; if sent, must be `password`.
+          pattern: "^password$"
+        username:
+          type: string
+          description: The user's email address.
+          example: "user@example.com"
+        password:
+          type: string
+          format: password
+          example: "S3curePassw0rd!"
+        scope:
+          type: string
+          description: Optional OAuth2 scopes (space-delimited). Unused by this API.
+          default: ""
+        client_id:
+          type: string
+          nullable: true
+        client_secret:
+          type: string
+          nullable: true
+
+    Token:
+      type: object
+      description: JWT bearer token issued on successful login.
+      required: [access_token, token_type]
+      properties:
+        access_token:
+          type: string
+          description: "The JWT to send as `Authorization: Bearer <access_token>`."
+        token_type:
+          type: string
+          example: "bearer"
+
+    VerificationRequest:
+      type: object
+      required: [email]
+      description: Ask for a fresh verification email.
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+
+    VerifyEmailRequest:
+      type: object
+      required: [token]
+      description: Confirm an email using the token from the verification link.
+      properties:
+        token:
+          type: string
+          description: The verification token embedded in the emailed link.
+
+    MessageResponse:
+      type: object
+      description: Generic acknowledgement message.
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          example: "Successfully logged out"
+
+    HealthResponse:
+      type: object
+      required: [status, env]
+      properties:
+        status:
+          type: string
+          example: "ok"
+        env:
+          type: string
+          description: The deployment environment name (e.g. `local`, `production`).
+          example: "local"
+
+    # ---- Projects / File Upload -------------------------------------------
+    ProjectStatus:
+      type: string
+      description: |
+        Lifecycle of a project. Relevant to uploading:
+        `pending` → `uploading` → `queued`. `processing`/`completed`/`failed`
+        belong to the (out-of-scope) stem-separation stage.
+      enum:
+        - pending
+        - uploading
+        - queued
+        - processing
+        - completed
+        - failed
+
+    ProjectCreateRequest:
+      type: object
+      description: Payload for creating an empty project.
+      properties:
+        name:
+          type: string
+          nullable: true
+          description: 'Optional display name. Blank/omitted defaults to "Untitled project".'
+          example: "My remix session"
+
+    UploadUrlRequest:
+      type: object
+      required: [filename, content_type]
+      description: Request body for the one-shot create-project-and-presign endpoint.
+      properties:
+        filename:
+          type: string
+          description: |
+            Original filename. Sanitised server-side to a safe basename (any path
+            components are stripped); it becomes the storage object name.
+          example: "vocals.wav"
+        content_type:
+          $ref: '#/components/schemas/AudioContentType'
+        name:
+          type: string
+          nullable: true
+          description: 'Optional project name. Defaults to `filename`, else "Untitled project".'
+          example: "My remix session"
+        project_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            When set, add the file to this **existing** project (no new project,
+            no quota consumed) instead of creating one.
+          example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+    FileUploadUrlRequest:
+      type: object
+      required: [filename, content_type]
+      description: Request body for minting an upload URL against an existing project.
+      properties:
+        filename:
+          type: string
+          description: |
+            Original filename. Sanitised server-side to a safe basename (path
+            components stripped); it becomes the storage object name.
+          example: "vocals.wav"
+        content_type:
+          $ref: '#/components/schemas/AudioContentType'
+
+    AudioContentType:
+      type: string
+      description: |
+        Declared MIME type of the file being uploaded. Must be one of the
+        allowed audio types; anything else is rejected with `400`. Max file size
+        is **50 MB** (enforced by the storage bucket at PUT time).
+      enum:
+        - audio/mpeg
+        - audio/mp3
+        - audio/wav
+        - audio/x-wav
+        - audio/wave
+        - audio/flac
+        - audio/x-flac
+        - audio/mp4
+        - audio/aac
+        - audio/ogg
+        - audio/webm
+      example: "audio/wav"
+
+    UploadUrlResponse:
+      type: object
+      description: |
+        A one-time presigned URL to upload the file directly to Supabase Storage.
+      required: [project_id, storage_key, url, token]
+      properties:
+        project_id:
+          type: string
+          format: uuid
+          description: The project the file will belong to.
+        storage_key:
+          type: string
+          description: |
+            Object path within the input bucket
+            (`<user_id>/<project_id>/<filename>`). Informational; the client does
+            not need to construct it.
+          example: "3fa85f64-.../a1b2.../vocals.wav"
+        url:
+          type: string
+          description: |
+            Supabase signed upload URL to `PUT` the bytes to. **May be relative**
+            (e.g. `/object/upload/sign/...`); if so, prefix with
+            `<SUPABASE_URL>/storage/v1` to make it absolute.
+          example: "/object/upload/sign/audio-inputs/3fa85f64-.../vocals.wav?token=..."
+        token:
+          type: string
+          description: |
+            Single-use upload token (also embedded in `url`). Expires (~2h by
+            default). No `Authorization` header is needed for the storage PUT.
+
+    ProjectFileResponse:
+      type: object
+      description: Metadata for one uploaded input file, recorded at finalisation.
+      required:
+        [id, original_filename, storage_key, file_size_bytes, content_type, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: File ID — pass to `input-url`/`DELETE` to target this file.
+        original_filename:
+          type: string
+          example: "vocals.wav"
+        storage_key:
+          type: string
+          example: "3fa85f64-.../a1b2.../vocals.wav"
+        file_size_bytes:
+          type: integer
+          format: int64
+          description: Actual stored size in bytes, read back from storage.
+          example: 5242880
+        content_type:
+          type: string
+          example: "audio/wav"
+        created_at:
+          type: string
+          format: date-time
+
+    ProjectResponse:
+      type: object
+      description: A project and its uploaded input files.
+      required: [id, user_id, name, status, input_files, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "My remix session"
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        input_files:
+          type: array
+          description: Files uploaded to this project so far (empty until finalised).
+          items:
+            $ref: '#/components/schemas/ProjectFileResponse'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    InputUrlResponse:
+      type: object
+      required: [url, expires_in]
+      properties:
+        url:
+          type: string
+          description: Short-lived signed URL to download/preview the original audio.
+        expires_in:
+          type: integer
+          description: Lifetime of `url`, in seconds (echoes the request).
+          example: 3600
+
+    # ---- Errors ------------------------------------------------------------
+    HTTPError:
+      type: object
+      description: Standard FastAPI error envelope with a human-readable message.
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: Human-readable error message.
+          example: "Project not found"
+
+    HTTPValidationError:
+      type: object
+      description: FastAPI request-validation error (HTTP 422).
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationError'
+
+    ValidationError:
+      type: object
+      required: [loc, msg, type]
+      properties:
+        loc:
+          type: array
+          description: Location of the offending field (e.g. `["body", "email"]`).
+          items:
+            anyOf:
+              - type: string
+              - type: integer
+        msg:
+          type: string
+          description: Human-readable validation message.
+        type:
+          type: string
+          description: Machine-readable error type.

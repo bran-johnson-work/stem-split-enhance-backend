@@ -29,34 +29,107 @@ def _project(user_id: uuid.UUID) -> Project:
     )
 
 
-async def test_upload_audio_success(auth_client, monkeypatch, sample_user):
+async def test_create_project_success(auth_client, monkeypatch, sample_user):
     project = _project(sample_user.id)
     monkeypatch.setattr(
-        projects_module.project_service, "create_and_upload", AsyncMock(return_value=project)
+        projects_module.project_service, "create_project", AsyncMock(return_value=project)
+    )
+    resp = await auth_client.post("/api/v1/projects", json={"name": "My song"})
+    assert resp.status_code == 201
+    assert resp.json()["id"] == str(project.id)
+
+
+async def test_create_project_quota_exceeded(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        projects_module.project_service,
+        "create_project",
+        AsyncMock(side_effect=ValueError("Monthly project limit reached (3).")),
+    )
+    resp = await auth_client.post("/api/v1/projects", json={"name": "My song"})
+    assert resp.status_code == 400
+    assert "limit reached" in resp.json()["detail"]
+
+
+async def test_create_project_requires_auth(client):
+    resp = await client.post("/api/v1/projects", json={"name": "x"})
+    assert resp.status_code == 401
+
+
+async def test_create_project_upload_url_success(auth_client, monkeypatch, sample_user):
+    project = _project(sample_user.id)
+    signed = {"storage_key": "key/song.wav", "url": "https://up.example", "token": "tok"}
+    monkeypatch.setattr(
+        projects_module.project_service,
+        "create_file_upload_url",
+        AsyncMock(return_value=(project, signed)),
     )
     resp = await auth_client.post(
-        "/api/v1/projects/upload",
-        files={"file": ("song.wav", b"audio-bytes", "audio/wav")},
-        data={"name": "My song"},
+        f"/api/v1/projects/{project.id}/files/upload-url",
+        json={"filename": "song.wav", "content_type": "audio/wav"},
     )
     assert resp.status_code == 201
     body = resp.json()
-    assert body["id"] == str(project.id)
-    assert body["status"] == "queued"
+    assert body["project_id"] == str(project.id)
+    assert body["token"] == "tok"
 
 
-async def test_upload_audio_rejects_bad_type(auth_client, monkeypatch):
+async def test_create_project_upload_url_not_found(auth_client, monkeypatch):
     monkeypatch.setattr(
-        projects_module.project_service,
-        "create_and_upload",
-        AsyncMock(side_effect=ValueError("Unsupported audio content type: application/zip")),
+        projects_module.project_service, "create_file_upload_url", AsyncMock(return_value=None)
     )
     resp = await auth_client.post(
-        "/api/v1/projects/upload",
-        files={"file": ("x.zip", b"data", "application/zip")},
+        f"/api/v1/projects/{uuid.uuid4()}/files/upload-url",
+        json={"filename": "song.wav", "content_type": "audio/wav"},
     )
-    assert resp.status_code == 400
-    assert "Unsupported" in resp.json()["detail"]
+    assert resp.status_code == 404
+
+
+async def test_delete_project_file_success(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        projects_module.project_service, "delete_input_file", AsyncMock(return_value=True)
+    )
+    resp = await auth_client.delete(
+        f"/api/v1/projects/{uuid.uuid4()}/files/{uuid.uuid4()}"
+    )
+    assert resp.status_code == 204
+
+
+async def test_delete_project_file_project_missing(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        projects_module.project_service, "delete_input_file", AsyncMock(return_value=None)
+    )
+    resp = await auth_client.delete(
+        f"/api/v1/projects/{uuid.uuid4()}/files/{uuid.uuid4()}"
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Project not found"
+
+
+async def test_delete_project_file_file_missing(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        projects_module.project_service, "delete_input_file", AsyncMock(return_value=False)
+    )
+    resp = await auth_client.delete(
+        f"/api/v1/projects/{uuid.uuid4()}/files/{uuid.uuid4()}"
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "File not found"
+
+
+async def test_delete_project_success(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        projects_module.project_service, "delete_project", AsyncMock(return_value=True)
+    )
+    resp = await auth_client.delete(f"/api/v1/projects/{uuid.uuid4()}")
+    assert resp.status_code == 204
+
+
+async def test_delete_project_not_found(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        projects_module.project_service, "delete_project", AsyncMock(return_value=None)
+    )
+    resp = await auth_client.delete(f"/api/v1/projects/{uuid.uuid4()}")
+    assert resp.status_code == 404
 
 
 async def test_create_upload_url_success(auth_client, monkeypatch, sample_user):
@@ -166,11 +239,3 @@ async def test_input_url_not_found(auth_client, monkeypatch):
     )
     resp = await auth_client.get(f"/api/v1/projects/{uuid.uuid4()}/input-url")
     assert resp.status_code == 404
-
-
-async def test_upload_requires_auth(client):
-    resp = await client.post(
-        "/api/v1/projects/upload",
-        files={"file": ("song.wav", b"audio", "audio/wav")},
-    )
-    assert resp.status_code == 401
