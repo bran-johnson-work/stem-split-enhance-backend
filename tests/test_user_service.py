@@ -1,3 +1,5 @@
+import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -56,6 +58,27 @@ async def test_authenticate_returns_user_on_success(service, fake_db, sample_use
     sample_user.password_hash = hash_password("correct-horse")
     service.repository.get_by_email.return_value = sample_user
     assert await service.authenticate(fake_db, sample_user.email, "correct-horse") is sample_user
+
+
+async def test_authenticate_rejects_passwordless_oauth_account(service, fake_db, sample_user):
+    # OAuth2/social account: no local password. No submitted password — empty or
+    # otherwise — may authenticate it.
+    sample_user.password_hash = None
+    service.repository.get_by_email.return_value = sample_user
+    assert await service.authenticate(fake_db, sample_user.email, "") is None
+    assert await service.authenticate(fake_db, sample_user.email, "anything") is None
+
+
+async def test_update_user_rejects_duplicate_email(service, fake_db, sample_user):
+    other = SimpleNamespace(id=uuid.uuid4())
+    service.repository.get.return_value = sample_user
+    service.repository.get_by_email.return_value = other
+
+    with pytest.raises(ValueError, match="already registered"):
+        await service.update_user(
+            fake_db, sample_user.id, UserUpdate(email="taken@example.com")
+        )
+    service.repository.update.assert_not_called()
 
 
 async def test_update_user_returns_none_when_missing(service, fake_db):

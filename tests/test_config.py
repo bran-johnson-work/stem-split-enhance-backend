@@ -48,9 +48,22 @@ def test_production_guard_raises_without_secret():
         Settings(app_env="production", secret_key="").assert_production_ready()
 
 
-def test_production_guard_passes_with_secret():
-    # Should not raise.
-    Settings(app_env="production", secret_key="a-strong-random-value").assert_production_ready()
+def test_production_guard_passes_with_secret_and_explicit_cors():
+    # Should not raise: strong secret + explicit (non-wildcard) origins.
+    Settings(
+        app_env="production",
+        secret_key="a-strong-random-value",
+        cors_origins="https://app.example.com",
+    ).assert_production_ready()
+
+
+def test_production_guard_rejects_wildcard_cors():
+    with pytest.raises(RuntimeError, match="CORS_ORIGINS"):
+        Settings(
+            app_env="production",
+            secret_key="a-strong-random-value",
+            cors_origins="*",
+        ).assert_production_ready()
 
 
 def test_local_env_skips_production_guard():
