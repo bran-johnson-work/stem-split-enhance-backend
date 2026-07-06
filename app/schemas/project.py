@@ -33,7 +33,7 @@ class ProjectResponse(BaseModel):
     user_id: uuid.UUID
     name: str
     status: ProjectStatus
-    input_file: ProjectFileResponse | None = None
+    input_files: list[ProjectFileResponse] = []
     created_at: datetime
     updated_at: datetime
 
@@ -51,6 +51,8 @@ class UploadUrlRequest(BaseModel):
     filename: str
     content_type: str
     name: str | None = None
+    # When set, add the file to an existing project instead of creating a new one.
+    project_id: uuid.UUID | None = None
 
 
 class UploadUrlResponse(BaseModel):

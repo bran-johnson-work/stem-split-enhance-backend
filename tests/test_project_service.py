@@ -1,10 +1,12 @@
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.models.project import Project, ProjectStatus
+from app.models.subscription import SubscriptionStatus
 from app.services import project_service as project_service_module
 from app.services.project_service import ProjectService
 
@@ -26,6 +28,8 @@ def service() -> ProjectService:
     svc = ProjectService()
     svc.repository = AsyncMock()
     svc.file_repository = AsyncMock()
+    # Quota enforcement is exercised in dedicated tests; neutralise it elsewhere.
+    svc._enforce_project_quota = AsyncMock()
     return svc
 
 
@@ -140,7 +144,7 @@ async def test_create_upload_url_rejects_bad_type(service, fake_db):
 async def test_complete_upload_records_stored_file(service, fake_db, monkeypatch):
     user_id = uuid.uuid4()
     project = _project(user_id)
-    project.input_file = None
+    project.input_files = []
     service.repository.get_for_user.return_value = project
     service.repository.update.return_value = project
 
@@ -152,8 +156,8 @@ async def test_complete_upload_records_stored_file(service, fake_db, monkeypatch
     result = await service.complete_upload(fake_db, project_id=project.id, user_id=user_id)
 
     assert result is project
-    service.file_repository.create_for_project.assert_awaited_once()
-    kwargs = service.file_repository.create_for_project.call_args.kwargs
+    service.file_repository.upsert_for_project.assert_awaited_once()
+    kwargs = service.file_repository.upsert_for_project.call_args.kwargs
     assert kwargs["storage_key"] == f"{user_id}/{project.id}/song.wav"
     assert kwargs["file_size_bytes"] == 2048
     assert kwargs["content_type"] == "audio/wav"
@@ -167,13 +171,13 @@ async def test_complete_upload_missing_project_returns_none(service, fake_db):
         fake_db, project_id=uuid.uuid4(), user_id=uuid.uuid4()
     )
     assert result is None
-    service.file_repository.create_for_project.assert_not_called()
+    service.file_repository.upsert_for_project.assert_not_called()
 
 
 async def test_complete_upload_no_object_raises(service, fake_db, monkeypatch):
     user_id = uuid.uuid4()
     project = _project(user_id)
-    project.input_file = None
+    project.input_files = []
     service.repository.get_for_user.return_value = project
 
     monkeypatch.setattr(
@@ -182,7 +186,7 @@ async def test_complete_upload_no_object_raises(service, fake_db, monkeypatch):
 
     with pytest.raises(ValueError, match="No uploaded file found"):
         await service.complete_upload(fake_db, project_id=project.id, user_id=user_id)
-    service.file_repository.create_for_project.assert_not_called()
+    service.file_repository.upsert_for_project.assert_not_called()
 
 
 async def test_cleans_up_storage_on_db_failure(service, fake_db, monkeypatch):
@@ -203,3 +207,114 @@ async def test_cleans_up_storage_on_db_failure(service, fake_db, monkeypatch):
 
     fake_db.rollback.assert_awaited_once()
     delete_mock.assert_called_once()  # orphaned object removed
+
+
+# --- one-to-many re-upload -------------------------------------------------
+
+
+async def test_reupload_to_existing_project_appends(service, fake_db, monkeypatch):
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    service.repository.get_for_user.return_value = project
+    service.repository.update.return_value = project
+
+    upload_mock = MagicMock(return_value="key")
+    monkeypatch.setattr(project_service_module.storage, "upload_file", upload_mock)
+
+    result = await service.create_and_upload(
+        fake_db,
+        user_id=user_id,
+        name="Song",
+        file=StubUpload(b"more-audio", "audio/wav"),
+        project_id=project.id,
+    )
+
+    assert result is project
+    service.repository.get_for_user.assert_awaited_once()
+    # Existing project → upsert (idempotent on repeat key), never a new project.
+    service.file_repository.upsert_for_project.assert_awaited_once()
+    service.file_repository.create_for_project.assert_not_called()
+    service.repository.create.assert_not_called()
+    # Re-uploading to an existing project must not consume monthly quota.
+    service._enforce_project_quota.assert_not_called()
+    fake_db.commit.assert_awaited_once()
+
+
+async def test_reupload_missing_project_returns_none(service, fake_db):
+    service.repository.get_for_user.return_value = None
+    result = await service.create_and_upload(
+        fake_db,
+        user_id=uuid.uuid4(),
+        name="Song",
+        file=StubUpload(b"audio", "audio/wav"),
+        project_id=uuid.uuid4(),
+    )
+    assert result is None
+    service.file_repository.create_for_project.assert_not_called()
+    service.file_repository.upsert_for_project.assert_not_called()
+
+
+# --- monthly quota enforcement ---------------------------------------------
+
+
+def _quota_service(monkeypatch, *, subscription, plan, used):
+    """A service with the real quota method but mocked plan/subscription repos."""
+    svc = ProjectService()
+    svc.repository = AsyncMock()
+    svc.repository.count_for_user_since.return_value = used
+
+    sub_repo = AsyncMock()
+    sub_repo.get_for_user.return_value = subscription
+    plan_repo = AsyncMock()
+    plan_repo.get_by_name.return_value = plan
+    monkeypatch.setattr(project_service_module, "subscription_repository", sub_repo)
+    monkeypatch.setattr(project_service_module, "plan_repository", plan_repo)
+    return svc
+
+
+async def test_quota_blocks_when_at_free_limit(fake_db, monkeypatch):
+    # No subscription → falls back to the seeded free plan (3/month).
+    svc = _quota_service(
+        monkeypatch,
+        subscription=None,
+        plan=SimpleNamespace(max_projects_per_month=3),
+        used=3,
+    )
+    with pytest.raises(ValueError, match="Monthly project limit reached"):
+        await svc._enforce_project_quota(fake_db, uuid.uuid4())
+
+
+async def test_quota_allows_under_limit(fake_db, monkeypatch):
+    svc = _quota_service(
+        monkeypatch,
+        subscription=None,
+        plan=SimpleNamespace(max_projects_per_month=3),
+        used=2,
+    )
+    await svc._enforce_project_quota(fake_db, uuid.uuid4())  # no raise
+
+
+async def test_quota_unlimited_plan_skips_count(fake_db, monkeypatch):
+    now = datetime.now(timezone.utc)
+    subscription = SimpleNamespace(
+        status=SubscriptionStatus.ACTIVE,
+        current_period_start=now,
+        plan=SimpleNamespace(max_projects_per_month=None),
+    )
+    svc = _quota_service(monkeypatch, subscription=subscription, plan=None, used=999)
+    await svc._enforce_project_quota(fake_db, uuid.uuid4())  # no raise
+    svc.repository.count_for_user_since.assert_not_called()
+
+
+async def test_quota_uses_active_subscription_window(fake_db, monkeypatch):
+    now = datetime.now(timezone.utc)
+    subscription = SimpleNamespace(
+        status=SubscriptionStatus.ACTIVE,
+        current_period_start=now,
+        plan=SimpleNamespace(max_projects_per_month=20),
+    )
+    svc = _quota_service(monkeypatch, subscription=subscription, plan=None, used=20)
+    with pytest.raises(ValueError, match="reached \\(20\\)"):
+        await svc._enforce_project_quota(fake_db, uuid.uuid4())
+    # Counted against the billing-period start, not the calendar month.
+    assert svc.repository.count_for_user_since.call_args.args[2] == now

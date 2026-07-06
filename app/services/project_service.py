@@ -1,6 +1,7 @@
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -9,11 +10,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import storage
 from app.core.config import get_settings
 from app.models.project import Project, ProjectStatus
+from app.models.subscription import SubscriptionStatus
+from app.repositories.plan_repository import plan_repository
 from app.repositories.project_file_repository import project_file_repository
 from app.repositories.project_repository import project_repository
+from app.repositories.subscription_repository import subscription_repository
 from app.schemas.project import ProjectCreate
 
 logger = logging.getLogger(__name__)
+
+# Plan a user falls back to when they have no (active) subscription row.
+DEFAULT_PLAN_NAME = "free"
 
 
 def _sanitize_filename(filename: str | None) -> str:
@@ -32,13 +39,62 @@ class ProjectService:
         self.repository = project_repository
         self.file_repository = project_file_repository
 
+    async def _enforce_project_quota(self, db: AsyncSession, user_id: uuid.UUID) -> None:
+        """Reject creation when the user is at their plan's monthly project cap.
+
+        The window is the active subscription's billing period when present,
+        otherwise the current calendar month (UTC) against the ``free`` plan.
+        Plans with ``max_projects_per_month is None`` are unlimited. Counting is
+        an indexed ``COUNT`` on ``projects`` — cheap because it is bounded per
+        user; swap for a usage-ledger table if billing-period contention appears.
+        """
+        subscription = await subscription_repository.get_for_user(db, user_id)
+        now = datetime.now(timezone.utc)
+
+        if (
+            subscription is not None
+            and subscription.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING)
+            and subscription.current_period_start is not None
+        ):
+            plan = subscription.plan
+            window_start = subscription.current_period_start
+        else:
+            plan = await plan_repository.get_by_name(db, DEFAULT_PLAN_NAME)
+            window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        limit = plan.max_projects_per_month if plan is not None else None
+        if limit is None:
+            # Unlimited plan, or the free plan is unseeded — don't hard-block uploads.
+            if plan is None:
+                logger.warning(
+                    "No '%s' plan found while enforcing quota; allowing upload.",
+                    DEFAULT_PLAN_NAME,
+                )
+            return
+
+        used = await self.repository.count_for_user_since(db, user_id, window_start)
+        if used >= limit:
+            raise ValueError(
+                f"Monthly project limit reached ({limit}). Upgrade your plan to create more."
+            )
+
     async def create_and_upload(
-        self, db: AsyncSession, *, user_id: uuid.UUID, name: str, file: UploadFile
-    ) -> Project:
+        self,
+        db: AsyncSession,
+        *,
+        user_id: uuid.UUID,
+        name: str,
+        file: UploadFile,
+        project_id: uuid.UUID | None = None,
+    ) -> Project | None:
         """Validate an uploaded audio file, store it in Supabase, and record it.
 
-        Raises ``ValueError`` on invalid input (empty file, unsupported type, too
-        large) so the endpoint can translate it into a 4xx response.
+        When ``project_id`` is given the file is added to that existing project
+        (one-to-many); otherwise a new project is created after a monthly-quota
+        check. Returns ``None`` if ``project_id`` is supplied but not found for
+        the user. Raises ``ValueError`` on invalid input (empty file,
+        unsupported type, too large, or quota exceeded) so the endpoint can
+        translate it into a 4xx response.
         """
         settings = get_settings()
 
@@ -56,11 +112,22 @@ class ProjectService:
 
         original_filename = _sanitize_filename(file.filename)
 
-        # Create the project first so the storage key can be namespaced by its id.
-        project = await self.repository.create(
-            db,
-            ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.UPLOADING),
-        )
+        if project_id is not None:
+            project = await self.repository.get_for_user(db, project_id, user_id)
+            if project is None:
+                return None
+            reuse = True
+            project = await self.repository.update(
+                db, project, {"status": ProjectStatus.UPLOADING}
+            )
+        else:
+            await self._enforce_project_quota(db, user_id)
+            reuse = False
+            # Create the project first so the storage key can be namespaced by its id.
+            project = await self.repository.create(
+                db,
+                ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.UPLOADING),
+            )
 
         storage_key = f"{user_id}/{project.id}/{original_filename}"
 
@@ -74,7 +141,13 @@ class ProjectService:
                 content_type,
             )
 
-            await self.file_repository.create_for_project(
+            # Re-uploading to an existing project may hit an existing key, so upsert.
+            record = (
+                self.file_repository.upsert_for_project
+                if reuse
+                else self.file_repository.create_for_project
+            )
+            await record(
                 db,
                 project_id=project.id,
                 original_filename=original_filename,
@@ -95,7 +168,7 @@ class ProjectService:
                 logger.warning("Failed to clean up orphaned upload at %s", storage_key)
             raise
 
-        await db.refresh(project, attribute_names=["input_file"])
+        await db.refresh(project, attribute_names=["input_files"])
         return project
 
     async def create_upload_url(
@@ -106,14 +179,19 @@ class ProjectService:
         name: str,
         filename: str,
         content_type: str,
-    ) -> tuple[Project, dict[str, str]]:
+        project_id: uuid.UUID | None = None,
+    ) -> tuple[Project, dict[str, str]] | None:
         """Create a project and mint a presigned URL for a *direct* client upload.
 
         The bytes go client -> Supabase; the API only validates the declared
         content type and hands back a one-time upload URL. The final file
         metadata is recorded later by :meth:`complete_upload`.
 
-        Raises ``ValueError`` on an unsupported content type.
+        When ``project_id`` is given the URL targets an existing project (adding
+        another file to it); otherwise a new project is created after a
+        monthly-quota check. Returns ``None`` when ``project_id`` is supplied but
+        not found for the user. Raises ``ValueError`` on an unsupported content
+        type or when the quota is exceeded.
         """
         settings = get_settings()
 
@@ -123,11 +201,20 @@ class ProjectService:
 
         original_filename = _sanitize_filename(filename)
 
-        # Create the project first so the storage key can be namespaced by its id.
-        project = await self.repository.create(
-            db,
-            ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.UPLOADING),
-        )
+        if project_id is not None:
+            project = await self.repository.get_for_user(db, project_id, user_id)
+            if project is None:
+                return None
+            project = await self.repository.update(
+                db, project, {"status": ProjectStatus.UPLOADING}
+            )
+        else:
+            await self._enforce_project_quota(db, user_id)
+            # Create the project first so the storage key can be namespaced by its id.
+            project = await self.repository.create(
+                db,
+                ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.UPLOADING),
+            )
         storage_key = f"{user_id}/{project.id}/{original_filename}"
 
         signed = await run_in_threadpool(
@@ -143,55 +230,76 @@ class ProjectService:
     async def complete_upload(
         self, db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID
     ) -> Project | None:
-        """Confirm a presigned upload finished, recording the stored file.
+        """Confirm a presigned upload finished, recording the stored file(s).
 
-        Verifies the object actually landed in storage (never trusting client
-        input) and reads its real size / content type before moving the project
-        to ``QUEUED``. Returns ``None`` if the project isn't found for the user;
-        raises ``ValueError`` if no uploaded file exists under the project prefix.
+        Verifies the objects actually landed in storage (never trusting client
+        input) and records each one under the project (one-to-many), reading its
+        real size / content type, before moving the project to ``QUEUED``.
+        Idempotent: re-recording an existing storage key refreshes it in place.
+        Returns ``None`` if the project isn't found for the user; raises
+        ``ValueError`` if no uploaded file exists under the project prefix.
         """
         project = await self.repository.get_for_user(db, project_id, user_id)
         if project is None:
             return None
-        if project.input_file is not None:
-            return project  # already completed — idempotent
 
         prefix = f"{user_id}/{project.id}"
         objects = await run_in_threadpool(
             storage.list_objects, storage.BUCKET_INPUTS, prefix
         )
-        stored = next((o for o in objects if o.get("name")), None)
-        if stored is None:
+        stored = [o for o in objects if o.get("name")]
+        if not stored:
+            if project.input_files:
+                return project  # nothing new in storage but already recorded — idempotent
             raise ValueError("No uploaded file found for this project")
 
-        metadata = stored.get("metadata") or {}
-        filename = stored["name"]
-
-        await self.file_repository.create_for_project(
-            db,
-            project_id=project.id,
-            original_filename=filename,
-            storage_key=f"{prefix}/{filename}",
-            file_size_bytes=int(metadata.get("size") or 0),
-            content_type=metadata.get("mimetype") or "application/octet-stream",
-        )
-        project = await self.repository.update(db, project, {"status": ProjectStatus.QUEUED})
+        for obj in stored:
+            metadata = obj.get("metadata") or {}
+            filename = obj["name"]
+            await self.file_repository.upsert_for_project(
+                db,
+                project_id=project.id,
+                original_filename=filename,
+                storage_key=f"{prefix}/{filename}",
+                file_size_bytes=int(metadata.get("size") or 0),
+                content_type=metadata.get("mimetype") or "application/octet-stream",
+            )
+        if project.status != ProjectStatus.QUEUED:
+            project = await self.repository.update(db, project, {"status": ProjectStatus.QUEUED})
         await db.commit()
 
-        await db.refresh(project, attribute_names=["input_file"])
+        await db.refresh(project, attribute_names=["input_files"])
         return project
 
     async def get_input_url(
-        self, db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID, expires_in: int = 3600
+        self,
+        db: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        user_id: uuid.UUID,
+        file_id: uuid.UUID | None = None,
+        expires_in: int = 3600,
     ) -> str | None:
-        """Return a short-lived signed URL for a project's input audio, if any."""
+        """Return a short-lived signed URL for a project's input audio, if any.
+
+        With ``file_id`` the URL points at that specific file (must belong to the
+        project); without it, the most recently uploaded file is used.
+        """
         project = await self.repository.get_for_user(db, project_id, user_id)
-        if project is None or project.input_file is None:
+        if project is None or not project.input_files:
             return None
+
+        if file_id is not None:
+            target = next((f for f in project.input_files if f.id == file_id), None)
+        else:
+            target = max(project.input_files, key=lambda f: f.created_at)
+        if target is None:
+            return None
+
         return await run_in_threadpool(
             storage.get_signed_url,
             storage.BUCKET_INPUTS,
-            project.input_file.storage_key,
+            target.storage_key,
             expires_in,
         )
 
