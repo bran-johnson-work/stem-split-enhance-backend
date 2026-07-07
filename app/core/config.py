@@ -64,6 +64,20 @@ class Settings(BaseSettings):
 
     require_email_verification: bool = True
 
+    # --- Stem-separation engine + worker ---
+    # HT-Demucs fine-tuned bag (vocals / drums / bass / other).
+    demucs_model: str = "htdemucs_ft"
+    # HT-Demucs 6-source model, adds guitar + piano.
+    instruments_model: str = "htdemucs_6s"
+    # Toggle the optional stages. Instruments = the guitar/piano pass; enhancement = the
+    # DSP restoration chain. Turning either off makes jobs faster/cheaper.
+    enable_instruments: bool = True
+    enable_enhancement: bool = True
+    # How often an idle worker polls the queue for the next PENDING job.
+    worker_poll_interval_seconds: float = 5.0
+    # Scratch dir for a job's temp files; empty => the OS default temp dir.
+    job_scratch_dir: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
