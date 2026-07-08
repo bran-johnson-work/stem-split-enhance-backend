@@ -1,4 +1,5 @@
 import uuid
+from typing import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,17 @@ class ProjectFileRepository(BaseRepository[ProjectFile, ProjectCreate, ProjectUp
             )
         )
         return result.scalars().first()
+
+    async def list_for_project(
+        self, db: AsyncSession, project_id: uuid.UUID
+    ) -> Sequence[ProjectFile]:
+        """List a project's uploaded input files, oldest first."""
+        result = await db.execute(
+            select(ProjectFile)
+            .where(ProjectFile.project_id == project_id)
+            .order_by(ProjectFile.created_at)
+        )
+        return result.scalars().all()
 
     async def create_for_project(
         self,
