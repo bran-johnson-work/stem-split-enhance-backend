@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Stem API — Upload &amp; Process Tester</title>
+<!-- Official Supabase JS client: used only for the presigned PUT to Storage
+     (handles the signed-upload wire format across SDK versions). -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; margin: 22px 0 8px; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin: 8px 0 2px; }
+  input { width: 100%; padding: 7px 9px; border: 1px solid #8886; border-radius: 6px; background: #0000000a; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 220px; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #6b7280; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  #bar { height: 10px; background: #8883; border-radius: 6px; overflow: hidden; margin: 8px 0; }
+  #bar > div { height: 100%; width: 0; background: #22c55e; transition: width .3s; }
+  #log { white-space: pre-wrap; word-break: break-word; background: #0b1020; color: #cbd5e1; border-radius: 8px; padding: 12px; height: 260px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .ok { background: #16a34a33; color: #16a34a; }
+  .err { background: #dc262633; color: #dc2626; }
+  a { color: #3b82f6; }
+  .stem { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid #8882; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+  <h1>Stem API — Upload &amp; Process Tester</h1>
+  <small>Drives the full flow: login → presigned upload → complete → process → poll → download stems.</small>
+
+  <h2>1. Configuration</h2>
+  <fieldset>
+    <div class="row">
+      <div>
+        <label>API base URL</label>
+        <input id="apiBase" placeholder="http://localhost:8000" />
+      </div>
+      <div>
+        <label>Supabase URL</label>
+        <input id="sbUrl" placeholder="https://xxxx.supabase.co" />
+      </div>
+    </div>
+    <label>Supabase anon key <small>(public — safe in the browser)</small></label>
+    <input id="sbAnon" placeholder="eyJ..." />
+    <label>Input bucket</label>
+    <input id="bucket" value="audio-inputs" />
+  </fieldset>
+
+  <h2>2. Authenticate</h2>
+  <fieldset>
+    <div class="row">
+      <div><label>Email</label><input id="email" type="email" placeholder="you@example.com" /></div>
+      <div><label>Password</label><input id="password" type="password" placeholder="••••••••" /></div>
+    </div>
+    <div class="btns">
+      <button id="btnLogin">Log in</button>
+      <button id="btnRegister" class="secondary">Register</button>
+      <span id="authState" class="pill err">no token</span>
+    </div>
+    <small>Registration needs email verification unless <code>REQUIRE_EMAIL_VERIFICATION=false</code> in your local <code>.env</code>.</small>
+  </fieldset>
+
+  <h2>3. Upload &amp; process</h2>
+  <fieldset>
+    <div class="row">
+      <div><label>Audio file</label><input id="file" type="file" accept="audio/*" /></div>
+      <div><label>Project name <small>(optional)</small></label><input id="projName" placeholder="My track" /></div>
+    </div>
+    <div class="btns">
+      <button id="btnRun">▶ Run full flow</button>
+      <button id="btnProcessOnly" class="secondary" title="Skip upload, process an existing project id">Process existing…</button>
+    </div>
+    <div id="bar"><div></div></div>
+    <div id="stems"></div>
+  </fieldset>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const CFG_KEYS = ["apiBase", "sbUrl", "sbAnon", "bucket", "email"];
+
+// --- persistence ---
+CFG_KEYS.forEach((k) => { const v = localStorage.getItem("st_" + k); if (v) $(k).value = v; });
+if (!$("apiBase").value) $("apiBase").value = "http://localhost:8000";
+CFG_KEYS.forEach((k) => $(k).addEventListener("change", () => localStorage.setItem("st_" + k, $(k).value.trim())));
+
+let token = localStorage.getItem("st_token") || "";
+setAuth(token);
+
+function setAuth(t) {
+  token = t || "";
+  if (token) localStorage.setItem("st_token", token); else localStorage.removeItem("st_token");
+  $("authState").textContent = token ? "token set" : "no token";
+  $("authState").className = "pill " + (token ? "ok" : "err");
+}
+
+// --- logging ---
+function log(msg, obj) {
+  const line = "[" + new Date().toLocaleTimeString() + "] " + msg + (obj !== undefined ? "\n" + JSON.stringify(obj, null, 2) : "");
+  $("log").textContent += line + "\n";
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function setBar(p) { $("bar").firstElementChild.style.width = Math.max(0, Math.min(100, p)) + "%"; }
+
+// --- helpers ---
+const apiBase = () => $("apiBase").value.trim().replace(/\/$/, "");
+async function api(path, { method = "GET", json, form, auth = true } = {}) {
+  const headers = {};
+  if (auth && token) headers["Authorization"] = "Bearer " + token;
+  let body;
+  if (json) { headers["Content-Type"] = "application/json"; body = JSON.stringify(json); }
+  if (form) { headers["Content-Type"] = "application/x-www-form-urlencoded"; body = new URLSearchParams(form).toString(); }
+  const res = await fetch(apiBase() + path, { method, headers, body });
+  const text = await res.text();
+  let data; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) throw new Error(method + " " + path + " → " + res.status + ": " + (data && data.detail ? JSON.stringify(data.detail) : text));
+  return data;
+}
+
+function guessType(file) {
+  if (file.type) return file.type;
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  return { mp3: "audio/mpeg", wav: "audio/wav", flac: "audio/flac", m4a: "audio/mp4", ogg: "audio/ogg", webm: "audio/webm" }[ext] || "application/octet-stream";
+}
+
+// --- steps ---
+async function doRegister() {
+  const email = $("email").value.trim(), password = $("password").value;
+  if (!email || !password) return log("Enter email + password first.");
+  try {
+    const u = await api("/api/v1/auth/register", { method: "POST", auth: false, json: { email, password } });
+    log("Registered. If verification is required, verify before login.", u);
+  } catch (e) { log("Register failed: " + e.message); }
+}
+
+async function doLogin() {
+  const email = $("email").value.trim(), password = $("password").value;
+  if (!email || !password) return log("Enter email + password first.");
+  try {
+    const t = await api("/api/v1/auth/login", { method: "POST", auth: false, form: { username: email, password } });
+    setAuth(t.access_token);
+    log("Logged in. Token stored.");
+  } catch (e) { setAuth(""); log("Login failed: " + e.message); }
+}
+
+async function getUploadUrl(file) {
+  const payload = { filename: file.name, content_type: guessType(file), name: $("projName").value.trim() || file.name };
+  log("Requesting presigned upload URL…", payload);
+  const r = await api("/api/v1/projects/upload-url", { method: "POST", json: payload });
+  log("Got upload URL.", { project_id: r.project_id, storage_key: r.storage_key });
+  return r; // { project_id, storage_key, url, token }
+}
+
+async function putToStorage(signed, file) {
+  const sbUrl = $("sbUrl").value.trim(), anon = $("sbAnon").value.trim(), bucket = $("bucket").value.trim();
+  if (!sbUrl || !anon) throw new Error("Set Supabase URL + anon key in Configuration.");
+  const sb = window.supabase.createClient(sbUrl, anon);
+  log("Uploading file bytes straight to Supabase Storage…", { bucket, path: signed.storage_key });
+  const { error } = await sb.storage.from(bucket).uploadToSignedUrl(signed.storage_key, signed.token, file, {
+    contentType: guessType(file), upsert: true,
+  });
+  if (error) throw new Error("Storage upload failed: " + (error.message || JSON.stringify(error)));
+  log("Upload to Storage OK.");
+}
+
+async function completeUpload(projectId) {
+  const p = await api("/api/v1/projects/" + projectId + "/upload-complete", { method: "POST" });
+  log("Upload finalized. Project status: " + p.status);
+  return p;
+}
+
+async function startProcessing(projectId) {
+  const job = await api("/api/v1/projects/" + projectId + "/process", { method: "POST" });
+  log("Processing queued. Job " + job.id + " (" + job.status + ")");
+  return job;
+}
+
+async function pollJob(projectId, jobId) {
+  while (true) {
+    const job = await api("/api/v1/projects/" + projectId + "/jobs/" + jobId);
+    setBar(job.progress);
+    log("… " + job.status + " " + job.progress.toFixed(0) + "% — " + (job.current_step || ""));
+    if (job.status === "completed") return job;
+    if (job.status === "failed") throw new Error("Job failed: " + (job.error_message || "unknown"));
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
+async function renderStems(projectId, jobId) {
+  const r = await api("/api/v1/projects/" + projectId + "/jobs/" + jobId + "/stems");
+  const box = $("stems"); box.innerHTML = "<h2>Stems</h2>";
+  if (!r.stems.length) { box.innerHTML += "<small>No stems returned.</small>"; return; }
+  for (const s of r.stems) {
+    const div = document.createElement("div");
+    div.className = "stem";
+    div.innerHTML = '<span>' + s.stem_name + (s.is_enhanced ? ' <small>(enhanced)</small>' : '') +
+      '</span><a href="' + s.url + '" target="_blank" rel="noopener">download / play</a>';
+    box.appendChild(div);
+  }
+  log("Done — " + r.stems.length + " stems ready.");
+}
+
+async function runFullFlow() {
+  const file = $("file").files[0];
+  if (!token) return log("Log in first.");
+  if (!file) return log("Choose an audio file first.");
+  $("stems").innerHTML = ""; setBar(2);
+  try {
+    const signed = await getUploadUrl(file);
+    await putToStorage(signed, file);
+    await completeUpload(signed.project_id);
+    const job = await startProcessing(signed.project_id);
+    await pollJob(signed.project_id, job.id);
+    await renderStems(signed.project_id, job.id);
+    setBar(100);
+  } catch (e) { log("✗ " + e.message); }
+}
+
+async function processExisting() {
+  const projectId = prompt("Existing project_id to process:");
+  if (!projectId) return;
+  try {
+    const job = await startProcessing(projectId.trim());
+    const done = await pollJob(projectId.trim(), job.id);
+    await renderStems(projectId.trim(), job.id);
+    setBar(100); void done;
+  } catch (e) { log("✗ " + e.message); }
+}
+
+$("btnLogin").onclick = doLogin;
+$("btnRegister").onclick = doRegister;
+$("btnRun").onclick = runFullFlow;
+$("btnProcessOnly").onclick = processExisting;
+log("Ready. Fill config + credentials, pick a file, then Run full flow.");
+</script>
+</body>
+</html>
