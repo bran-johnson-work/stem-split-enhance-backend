@@ -1,5 +1,6 @@
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import jwt
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import decode_access_token
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.repositories.revoked_token_repository import revoked_token_repository
 from app.repositories.user_repository import user_repository
 
@@ -52,3 +53,28 @@ async def get_current_user(
     if user is None:
         raise credentials_exception
     return user
+
+
+def require_role(*roles: UserRole) -> Callable[[User], Awaitable[User]]:
+    """Build a dependency that allows only the given role(s).
+
+    Reuses ``get_current_user`` (no duplicate JWT parsing / revocation checks) and
+    raises 403 if the authenticated user's role is not in ``roles``. Returns the
+    user so guarded routes can still receive ``current_user``.
+    """
+
+    async def _guard(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in roles:
+            logger.info(
+                "Forbidden: user_id=%s role=%s not in %s",
+                current_user.id,
+                current_user.role,
+                [r.value for r in roles],
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return current_user
+
+    return _guard

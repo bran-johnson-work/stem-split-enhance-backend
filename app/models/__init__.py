@@ -7,11 +7,12 @@ from app.models.project import Project, ProjectStatus
 from app.models.project_file import ProjectFile
 from app.models.revoked_token import RevokedToken
 from app.models.subscription import Subscription, SubscriptionStatus
-from app.models.user import User
+from app.models.user import User, UserRole
 
 __all__ = [
     "Base",
     "User",
+    "UserRole",
     "Plan",
     "Subscription",
     "SubscriptionStatus",

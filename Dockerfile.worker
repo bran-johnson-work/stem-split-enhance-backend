@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+
+# CPU-only image for the stem-separation worker (app.worker).
+# The API is deployed separately from its own image; this one carries the heavy
+# torch/demucs stack and runs the Postgres-queue consumer.
+FROM python:3.11-slim
+
+# libsndfile1: audio decoding for soundfile. ffmpeg is optional (only for exotic
+# formats like M4A/WMA that libsndfile can't read) — add it if you need them.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TORCH_HOME=/cache/torch
+
+WORKDIR /app
+
+# Install CPU-only torch first from PyTorch's CPU index so the default CUDA wheels
+# (~2-3 GB) are never pulled. The rest then see torch already satisfied.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+        "torch>=2.2,<3.0" "torchaudio>=2.2,<3.0"
+
+COPY requirements.txt requirements-worker.txt ./
+RUN pip install -r requirements-worker.txt
+
+COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
+
+# Drop root; pre-create the model cache dir owned by the unprivileged user.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /cache/torch \
+    && chown -R appuser:appuser /cache /app
+USER appuser
+
+# Model weights (~400 MB: htdemucs_ft + htdemucs_6s) download here on first run.
+# Mount a volume to persist them across restarts.
+VOLUME ["/cache/torch"]
+
+# Needs the same env as the API (DATABASE_URL_POOLED, SUPABASE_URL,
+# SUPABASE_SERVICE_ROLE_KEY, …) so it can reach Postgres + Storage.
+CMD ["python", "-m", "app.worker"]
