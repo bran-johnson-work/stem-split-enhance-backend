@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
+from app.models.user import UserRole
 
 _PASSWORD_MIN = 8
 _PASSWORD_MAX = 128
@@ -30,6 +31,7 @@ class UserResponse(UserBase):
     id: uuid.UUID
     is_active: bool
     is_verified: bool
+    role: UserRole
     created_at: datetime
     updated_at: datetime
 

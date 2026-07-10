@@ -1,7 +1,8 @@
+import enum
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, String
+from sqlalchemy import Boolean, Enum, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -11,6 +12,11 @@ if TYPE_CHECKING:
     from app.models.billing_event import BillingEvent
     from app.models.project import Project
     from app.models.subscription import Subscription
+
+
+class UserRole(str, enum.Enum):
+    USER = "USER"  # owns/manages only their own account and resources
+    ADMIN = "ADMIN"  # read-only visibility into all users/projects (internal utility)
 
 
 class User(Base, TimestampMixin):
@@ -26,6 +32,9 @@ class User(Base, TimestampMixin):
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole), default=UserRole.USER, nullable=False, index=True
+    )
 
     subscription: Mapped["Subscription | None"] = relationship(
         "Subscription", back_populates="user", uselist=False
