@@ -35,6 +35,24 @@ def _disable_outbound_email():
     settings.resend_api_key = original
 
 
+@pytest.fixture(autouse=True)
+def _disable_billing():
+    """Keep the suite deterministic even if ``.env`` carries real Stripe keys.
+
+    Blanking the Stripe keys makes billing default to *disabled* (checkout/portal
+    -> 503, webhook -> 404) so no test accidentally hits Stripe. Billing tests
+    that need it enabled set the keys via ``monkeypatch`` inside the test.
+    """
+    settings = get_settings()
+    original_secret = settings.stripe_secret_key
+    original_webhook = settings.stripe_webhook_secret
+    settings.stripe_secret_key = ""
+    settings.stripe_webhook_secret = ""
+    yield
+    settings.stripe_secret_key = original_secret
+    settings.stripe_webhook_secret = original_webhook
+
+
 @pytest.fixture
 def fake_db() -> MagicMock:
     """A stand-in AsyncSession where the async methods are awaitable mocks."""
