@@ -64,6 +64,22 @@ class Settings(BaseSettings):
 
     require_email_verification: bool = True
 
+    # --- Billing (Stripe) ---
+    # ``stripe_secret_key`` empty => billing is disabled: checkout/portal return a
+    # clean 503 and the webhook 404s, so local dev and tests stay network-free.
+    stripe_secret_key: str = ""
+    # Publishable key is only consumed by the frontend; exposed via GET config if needed.
+    stripe_publishable_key: str = ""
+    # Signing secret from the Stripe CLI (`stripe listen`) or the dashboard webhook.
+    stripe_webhook_secret: str = ""
+    stripe_api_base_url: str = "https://api.stripe.com"
+    stripe_timeout_seconds: float = 15.0
+    # Where Stripe Checkout / the Customer Portal send the user back to. Empty =>
+    # fall back to ``frontend_url``.
+    billing_success_url: str = ""
+    billing_cancel_url: str = ""
+    billing_portal_return_url: str = ""
+
     # --- Stem-separation engine + worker ---
     # HT-Demucs fine-tuned bag (vocals / drums / bass / other).
     demucs_model: str = "htdemucs_ft"
@@ -105,6 +121,23 @@ class Settings(BaseSettings):
     def email_enabled(self) -> bool:
         """Whether outbound email is configured (a Resend API key is present)."""
         return bool(self.resend_api_key)
+
+    @property
+    def billing_enabled(self) -> bool:
+        """Whether Stripe billing is configured (a secret key is present)."""
+        return bool(self.stripe_secret_key)
+
+    @property
+    def checkout_success_url(self) -> str:
+        return self.billing_success_url or f"{self.frontend_url}/billing/success"
+
+    @property
+    def checkout_cancel_url(self) -> str:
+        return self.billing_cancel_url or f"{self.frontend_url}/billing"
+
+    @property
+    def portal_return_url(self) -> str:
+        return self.billing_portal_return_url or f"{self.frontend_url}/billing"
 
     @property
     def email_uses_sandbox_sender(self) -> bool:
