@@ -40,9 +40,8 @@ class Settings(BaseSettings):
     signup_rate_limit_max_attempts: int = 10
     signup_rate_limit_window_seconds: int = 3600
 
-    # Audio uploads. 50 MB matches the Supabase Free-plan global upload ceiling;
-    # raise this (and the project's Storage limit) on a paid plan if needed.
-    max_upload_size_bytes: int = 50 * 1024 * 1024  # 50 MB
+
+    max_upload_size_bytes: int = 50 * 1024 * 1024  # 50 MB (Supabase Free ceiling)
     allowed_audio_content_types: str = (
         "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave,"
         "audio/flac,audio/x-flac,audio/mp4,audio/aac,audio/ogg,audio/webm"

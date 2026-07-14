@@ -65,6 +65,10 @@ class UploadUrlRequest(BaseModel):
     name: str | None = Field(default=None, max_length=_NAME_MAX)
     # When set, add the file to an existing project instead of creating a new one.
     project_id: uuid.UUID | None = None
+    # Optional declared byte size for a fast-fail plan check before the upload.
+    # Advisory only (the client may under-declare); the real size is enforced on
+    # the stored bytes at upload-complete.
+    file_size_bytes: int | None = Field(default=None, ge=1)
 
 
 class FileUploadUrlRequest(BaseModel):
@@ -72,6 +76,8 @@ class FileUploadUrlRequest(BaseModel):
 
     filename: str = Field(min_length=1, max_length=_FILENAME_MAX)
     content_type: str = Field(min_length=1, max_length=_CONTENT_TYPE_MAX)
+    # See ``UploadUrlRequest.file_size_bytes``: advisory fast-fail hint.
+    file_size_bytes: int | None = Field(default=None, ge=1)
 
 
 class UploadUrlResponse(BaseModel):

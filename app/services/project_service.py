@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import storage
 from app.core.config import get_settings
+from app.models.plan import Plan
 from app.models.project import Project, ProjectStatus
 from app.models.subscription import SubscriptionStatus
 from app.repositories.plan_repository import plan_repository
@@ -20,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 # Plan a user falls back to when they have no (active) subscription row.
 DEFAULT_PLAN_NAME = "free"
+
+
+class FileTooLargeError(ValueError):
+    """Raised when an upload exceeds the user's plan file-size limit.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` paths still catch
+    it, while endpoints can map it specifically to HTTP 413.
+    """
 
 
 def _sanitize_filename(filename: str | None) -> str:
@@ -38,14 +47,15 @@ class ProjectService:
         self.repository = project_repository
         self.file_repository = project_file_repository
 
-    async def _enforce_project_quota(self, db: AsyncSession, user_id: uuid.UUID) -> None:
-        """Reject creation when the user is at their plan's monthly project cap.
+    async def _effective_plan_and_window(
+        self, db: AsyncSession, user_id: uuid.UUID
+    ) -> tuple[Plan | None, datetime]:
+        """Resolve the user's effective plan and the start of the current usage window.
 
-        The window is the active subscription's billing period when present,
-        otherwise the current calendar month (UTC) against the ``free`` plan.
-        Plans with ``max_projects_per_month is None`` are unlimited. Counting is
-        an indexed ``COUNT`` on ``projects`` — cheap because it is bounded per
-        user; swap for a usage-ledger table if billing-period contention appears.
+        An ACTIVE/TRIALING subscription with a known period uses that plan and its
+        billing-period start; otherwise the user is on the ``free`` plan and the
+        window is the current calendar month (UTC). One subscription lookup feeds
+        both the project-quota gate and the file-size gate.
         """
         subscription = await subscription_repository.get_for_user(db, user_id)
         now = datetime.now(timezone.utc)
@@ -55,11 +65,42 @@ class ProjectService:
             and subscription.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING)
             and subscription.current_period_start is not None
         ):
-            plan = subscription.plan
-            window_start = subscription.current_period_start
-        else:
-            plan = await plan_repository.get_by_name(db, DEFAULT_PLAN_NAME)
-            window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return subscription.plan, subscription.current_period_start
+
+        plan = await plan_repository.get_by_name(db, DEFAULT_PLAN_NAME)
+        window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return plan, window_start
+
+    async def _effective_plan(self, db: AsyncSession, user_id: uuid.UUID) -> Plan | None:
+        """The user's effective plan (active subscription's plan, else ``free``)."""
+        plan, _ = await self._effective_plan_and_window(db, user_id)
+        return plan
+
+    def _enforce_file_size(self, plan: Plan | None, size_bytes: int) -> None:
+        """Reject an upload whose size exceeds the plan's per-file limit.
+
+        A missing plan (``free`` unseeded) or a non-positive/unknown size is a
+        no-op — we only hard-block when we have both a real limit and a real size.
+        Raises :class:`FileTooLargeError`.
+        """
+        if plan is None or size_bytes <= 0:
+            return
+        limit_bytes = plan.max_file_size_mb * 1024 * 1024
+        if size_bytes > limit_bytes:
+            raise FileTooLargeError(
+                f"File exceeds your plan's {plan.max_file_size_mb} MB upload limit."
+            )
+
+    async def _enforce_project_quota(self, db: AsyncSession, user_id: uuid.UUID) -> None:
+        """Reject creation when the user is at their plan's monthly project cap.
+
+        The window is the active subscription's billing period when present,
+        otherwise the current calendar month (UTC) against the ``free`` plan.
+        Plans with ``max_projects_per_month is None`` are unlimited. Counting is
+        an indexed ``COUNT`` on ``projects`` — cheap because it is bounded per
+        user; swap for a usage-ledger table if billing-period contention appears.
+        """
+        plan, window_start = await self._effective_plan_and_window(db, user_id)
 
         limit = plan.max_projects_per_month if plan is not None else None
         if limit is None:
@@ -104,13 +145,15 @@ class ProjectService:
         user_id: uuid.UUID,
         filename: str,
         content_type: str,
+        declared_size_bytes: int | None = None,
     ) -> tuple[Project, dict[str, str]] | None:
         """Mint a presigned URL to upload a file into an *existing* project.
 
         The project must already exist and belong to the user (create it first
         via :meth:`create_project`); no quota is consumed here. Returns ``None``
         when the project isn't found. Raises ``ValueError`` on an unsupported
-        content type. Delegates to :meth:`create_upload_url` with the project
+        content type, or :class:`FileTooLargeError` when a declared size exceeds
+        the plan limit. Delegates to :meth:`create_upload_url` with the project
         pinned, keeping a single presign code path.
         """
         return await self.create_upload_url(
@@ -120,6 +163,7 @@ class ProjectService:
             filename=filename,
             content_type=content_type,
             project_id=project_id,
+            declared_size_bytes=declared_size_bytes,
         )
 
     async def delete_input_file(
@@ -190,6 +234,7 @@ class ProjectService:
         filename: str,
         content_type: str,
         project_id: uuid.UUID | None = None,
+        declared_size_bytes: int | None = None,
     ) -> tuple[Project, dict[str, str]] | None:
         """Create a project and mint a presigned URL for a *direct* client upload.
 
@@ -201,13 +246,23 @@ class ProjectService:
         another file to it); otherwise a new project is created after a
         monthly-quota check. Returns ``None`` when ``project_id`` is supplied but
         not found for the user. Raises ``ValueError`` on an unsupported content
-        type or when the quota is exceeded.
+        type or when the quota is exceeded, or :class:`FileTooLargeError` when a
+        declared size exceeds the plan limit.
+
+        ``declared_size_bytes`` is a fast-fail hint: it lets us reject an
+        oversized upload *before* minting the URL, but a client can under-declare
+        or omit it — the authoritative size check runs on the real stored bytes
+        in :meth:`complete_upload`.
         """
         settings = get_settings()
 
         content_type = (content_type or "").lower()
         if content_type not in settings.allowed_audio_content_type_set:
             raise ValueError(f"Unsupported audio content type: {content_type or 'unknown'}")
+
+        if declared_size_bytes is not None:
+            plan = await self._effective_plan(db, user_id)
+            self._enforce_file_size(plan, declared_size_bytes)
 
         original_filename = _sanitize_filename(filename)
 
@@ -247,7 +302,8 @@ class ProjectService:
         real size / content type, before moving the project to ``QUEUED``.
         Idempotent: re-recording an existing storage key refreshes it in place.
         Returns ``None`` if the project isn't found for the user; raises
-        ``ValueError`` if no uploaded file exists under the project prefix.
+        ``ValueError`` if no uploaded file exists under the project prefix, or
+        :class:`FileTooLargeError` if a stored file exceeds the plan's size limit.
         """
         project = await self.repository.get_for_user(db, project_id, user_id)
         if project is None:
@@ -262,6 +318,32 @@ class ProjectService:
             if project.input_files:
                 return project  # nothing new in storage but already recorded — idempotent
             raise ValueError("No uploaded file found for this project")
+
+        # Authoritative file-size enforcement: Supabase's bucket limit is global
+        # (can't tell plans apart), so a user under the bucket ceiling but over
+        # *their* plan limit lands the bytes anyway. Reject and purge them here,
+        # reading the real stored size, before recording anything.
+        plan = await self._effective_plan(db, user_id)
+        limit_bytes = plan.max_file_size_mb * 1024 * 1024 if plan is not None else None
+        if limit_bytes is not None:
+            oversize = [
+                o
+                for o in stored
+                if int((o.get("metadata") or {}).get("size") or 0) > limit_bytes
+            ]
+            if oversize:
+                for o in oversize:
+                    try:
+                        await run_in_threadpool(
+                            storage.delete_file,
+                            storage.BUCKET_INPUTS,
+                            f"{prefix}/{o['name']}",
+                        )
+                    except Exception:  # pragma: no cover - best-effort cleanup
+                        logger.warning("Failed to delete oversize upload %s", o.get("name"))
+                raise FileTooLargeError(
+                    f"File exceeds your plan's {plan.max_file_size_mb} MB upload limit."
+                )
 
         for obj in stored:
             metadata = obj.get("metadata") or {}
