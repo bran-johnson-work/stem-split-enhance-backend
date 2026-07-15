@@ -46,6 +46,14 @@ async def test_record_heartbeat_issues_update_without_select(fake_db):
     fake_db.execute.assert_awaited_once()
 
 
+async def test_update_progress_issues_single_update_without_select(fake_db):
+    await processing_job_repository.update_progress(
+        fake_db, uuid.uuid4(), progress=42.0, current_step="Enhancing vocals"
+    )
+    # RCA-3: exactly one statement (the UPDATE) — no preceding SELECT/get().
+    fake_db.execute.assert_awaited_once()
+
+
 async def test_list_stale_processing_returns_scalars(fake_db, execute_result):
     jobs = [_pending_job()]
     fake_db.execute.return_value = execute_result(jobs)

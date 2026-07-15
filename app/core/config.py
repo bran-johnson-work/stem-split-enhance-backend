@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     # How often an idle worker polls the queue for the next PENDING job.
     worker_poll_interval_seconds: float = 5.0
 
+    # --- Progress-write debounce (RCA-3) ---
+    # How often the relay loop samples the engine's latest progress. Also caps how
+    # quickly a stage-boundary/label change reaches the DB.
+    worker_progress_poll_seconds: float = 2.0
+    # Persist a progress update when it jumps at least this many percentage points
+    # (below this, and with no label change, the write is skipped).
+    worker_progress_min_delta: float = 5.0
+    # ...or when at least this long has passed since the last write, so a long
+    # single stage still ticks over and never looks frozen to a watcher.
+    worker_progress_min_interval_seconds: float = 10.0
+
     # --- Worker lease / stuck-job recovery (RCA-1) ---
     # How often a busy worker refreshes its job's heartbeat while processing.
     worker_heartbeat_interval_seconds: float = 15.0

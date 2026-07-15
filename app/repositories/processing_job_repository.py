@@ -46,6 +46,25 @@ class ProcessingJobRepository(
         await db.flush()
         return job
 
+    async def update_progress(
+        self, db: AsyncSession, job_id: uuid.UUID, *, progress: float, current_step: str
+    ) -> None:
+        """Write progress/step in a single UPDATE — no read-modify-write (RCA-3).
+
+        Scoped to ``status == PROCESSING`` so a late progress write can't clobber
+        a job that has already completed, failed, or been requeued by the reaper.
+        Progress is clamped to 0..100. The caller owns the ``commit`` and decides
+        *when* a write is worth doing (see the throttle in app.worker.processor).
+        """
+        await db.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id == job_id,
+                ProcessingJob.status == JobStatus.PROCESSING,
+            )
+            .values(progress=max(0.0, min(100.0, progress)), current_step=current_step)
+        )
+
     async def record_heartbeat(self, db: AsyncSession, job_id: uuid.UUID) -> None:
         """Refresh the liveness stamp for an in-flight job — one UPDATE, no SELECT.
 
