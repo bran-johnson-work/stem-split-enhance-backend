@@ -92,6 +92,12 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = 5.0
     # Scratch dir for a job's temp files; empty => the OS default temp dir.
     job_scratch_dir: str = ""
+    # When set, completed stems are written to this local directory instead of
+    # being uploaded to the Supabase stems bucket — a workaround for the Free
+    # plan's 50 MB object cap, which rejects large WAV stems with HTTP 413. The
+    # on-disk layout mirrors the bucket: <dir>/<user_id>/<project_id>/stems/<name>.wav.
+    # Empty => upload to Supabase Storage as usual.
+    stems_local_dir: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

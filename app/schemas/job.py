@@ -49,7 +49,12 @@ class JobResponse(BaseModel):
 
 
 class StemDownload(BaseModel):
-    """A signed URL for one output stem."""
+    """A download reference for one output stem.
+
+    Normally a short-lived Supabase signed URL (``expires_in`` seconds). When the
+    worker saves stems to a local folder (``STEMS_LOCAL_DIR``), this is a ``file://``
+    URI pointing at the file on disk and ``expires_in`` is 0.
+    """
 
     stem_name: str
     is_enhanced: bool

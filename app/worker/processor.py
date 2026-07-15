@@ -11,7 +11,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import storage
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.engine.pipeline import FinalizedStem, separate_and_finalize
 from app.models.processing_job import JobStatus
 from app.models.project import ProjectStatus
@@ -110,20 +110,14 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
             await asyncio.sleep(1.0)
         finalized, _sr = await task
 
-        # 4. Upload each stem to the stems bucket and record it.
+        # 4. Persist each stem (Supabase bucket, or a local folder if configured) and record it.
         prefix = f"{project.user_id}/{project.id}/stems"
         for idx, stem in enumerate(finalized):
             await _set_progress(
-                db, job_id, 98.0 + idx / max(1, len(finalized)) * 1.5, f"Uploading {stem.stem_name}"
+                db, job_id, 98.0 + idx / max(1, len(finalized)) * 1.5, f"Saving {stem.stem_name}"
             )
             storage_key = f"{prefix}/{stem.stem_name}.wav"
-            await asyncio.to_thread(
-                storage.upload_file,
-                storage.BUCKET_STEMS,
-                storage_key,
-                stem.path.read_bytes(),
-                "audio/wav",
-            )
+            await asyncio.to_thread(_persist_stem, settings, storage_key, stem)
             await _record_output(db, project.id, job_id, storage_key, stem)
         await db.commit()
 
@@ -147,6 +141,21 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
         await _mark_failed(db, job_id, project.id, f"{type(exc).__name__}: {exc}")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _persist_stem(settings: Settings, storage_key: str, stem: FinalizedStem) -> None:
+    """Write one finalized stem to its destination (runs off the event loop).
+
+    Uploads to the Supabase stems bucket by default. When ``stems_local_dir`` is
+    configured, copies the file to ``<stems_local_dir>/<storage_key>`` on local
+    disk instead — sidestepping Supabase's 50 MB object cap on the Free plan.
+    """
+    if settings.stems_local_dir:
+        dest = Path(settings.stems_local_dir) / storage_key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(stem.path, dest)
+    else:
+        storage.upload_file(storage.BUCKET_STEMS, storage_key, stem.path.read_bytes(), "audio/wav")
 
 
 async def _record_output(
