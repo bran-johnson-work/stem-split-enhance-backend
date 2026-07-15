@@ -16,8 +16,10 @@ def service() -> ProjectService:
     svc = ProjectService()
     svc.repository = AsyncMock()
     svc.file_repository = AsyncMock()
-    # Quota enforcement is exercised in dedicated tests; neutralise it elsewhere.
+    # Quota + file-size enforcement are exercised in dedicated tests; neutralise
+    # them elsewhere (no plan => the file-size gate is a no-op).
     svc._enforce_project_quota = AsyncMock()
+    svc._effective_plan = AsyncMock(return_value=None)
     return svc
 
 
@@ -94,6 +96,76 @@ async def test_complete_upload_records_stored_file(service, fake_db, monkeypatch
     assert kwargs["content_type"] == "audio/wav"
     assert service.repository.update.call_args.args[2] == {"status": ProjectStatus.QUEUED}
     fake_db.commit.assert_awaited_once()
+
+
+async def test_complete_upload_rejects_oversize_file(service, fake_db, monkeypatch):
+    """A stored file over the plan limit is purged and the call fails with 413-path."""
+    from app.services.project_service import FileTooLargeError
+
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    project.input_files = []
+    service.repository.get_for_user.return_value = project
+    # Effective plan caps uploads at 20 MB; the stored object is 21 MB.
+    service._effective_plan = AsyncMock(return_value=SimpleNamespace(max_file_size_mb=20))
+
+    twenty_one_mb = 21 * 1024 * 1024
+    list_mock = MagicMock(
+        return_value=[{"name": "big.wav", "metadata": {"size": twenty_one_mb}}]
+    )
+    delete_mock = MagicMock()
+    monkeypatch.setattr(project_service_module.storage, "list_objects", list_mock)
+    monkeypatch.setattr(project_service_module.storage, "delete_file", delete_mock)
+
+    with pytest.raises(FileTooLargeError, match="20 MB"):
+        await service.complete_upload(fake_db, project_id=project.id, user_id=user_id)
+
+    # The oversize object was removed and nothing was recorded/queued.
+    delete_mock.assert_called_once()
+    assert delete_mock.call_args.args[1] == f"{user_id}/{project.id}/big.wav"
+    service.file_repository.upsert_for_project.assert_not_called()
+
+
+async def test_complete_upload_allows_file_at_plan_limit(service, fake_db, monkeypatch):
+    """A file exactly at the plan limit is accepted (boundary is inclusive)."""
+    user_id = uuid.uuid4()
+    project = _project(user_id)
+    project.input_files = []
+    service.repository.get_for_user.return_value = project
+    service.repository.update.return_value = project
+    service._effective_plan = AsyncMock(return_value=SimpleNamespace(max_file_size_mb=20))
+
+    exactly_twenty_mb = 20 * 1024 * 1024
+    monkeypatch.setattr(
+        project_service_module.storage,
+        "list_objects",
+        MagicMock(return_value=[{"name": "ok.wav", "metadata": {"size": exactly_twenty_mb}}]),
+    )
+
+    result = await service.complete_upload(fake_db, project_id=project.id, user_id=user_id)
+
+    assert result is project
+    service.file_repository.upsert_for_project.assert_awaited_once()
+
+
+async def test_create_upload_url_declared_size_over_limit_rejected(service, fake_db):
+    """Presign fast-fail: a declared size over the plan limit rejects before upload."""
+    from app.services.project_service import FileTooLargeError
+
+    service._effective_plan = AsyncMock(return_value=SimpleNamespace(max_file_size_mb=20))
+
+    with pytest.raises(FileTooLargeError, match="20 MB"):
+        await service.create_upload_url(
+            fake_db,
+            user_id=uuid.uuid4(),
+            name="Song",
+            filename="song.wav",
+            content_type="audio/wav",
+            declared_size_bytes=21 * 1024 * 1024,
+        )
+    # Rejected before any project row or presigned URL is created.
+    service.repository.create.assert_not_called()
+    service._enforce_project_quota.assert_not_called()
 
 
 async def test_complete_upload_missing_project_returns_none(service, fake_db):

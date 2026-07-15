@@ -16,7 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.main import app
-from app.models.user import User
+from app.models.user import User, UserRole
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +33,24 @@ def _disable_outbound_email():
     settings.resend_api_key = ""
     yield
     settings.resend_api_key = original
+
+
+@pytest.fixture(autouse=True)
+def _disable_billing():
+    """Keep the suite deterministic even if ``.env`` carries real Stripe keys.
+
+    Blanking the Stripe keys makes billing default to *disabled* (checkout/portal
+    -> 503, webhook -> 404) so no test accidentally hits Stripe. Billing tests
+    that need it enabled set the keys via ``monkeypatch`` inside the test.
+    """
+    settings = get_settings()
+    original_secret = settings.stripe_secret_key
+    original_webhook = settings.stripe_webhook_secret
+    settings.stripe_secret_key = ""
+    settings.stripe_webhook_secret = ""
+    yield
+    settings.stripe_secret_key = original_secret
+    settings.stripe_webhook_secret = original_webhook
 
 
 @pytest.fixture
@@ -60,6 +78,24 @@ def sample_user() -> User:
         full_name="Test User",
         is_active=True,
         is_verified=False,
+        role=UserRole.USER,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@pytest.fixture
+def admin_user() -> User:
+    """A User ORM instance with the ADMIN role."""
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return User(
+        id=uuid.uuid4(),
+        email="admin@example.com",
+        password_hash="salt:hash",
+        full_name="Admin User",
+        is_active=True,
+        is_verified=True,
+        role=UserRole.ADMIN,
         created_at=now,
         updated_at=now,
     )

@@ -39,6 +39,28 @@ class ProjectRepository(BaseRepository[Project, ProjectCreate, ProjectUpdate]):
         )
         return result.scalars().all()
 
+    async def list_all(
+        self, db: AsyncSession, skip: int = 0, limit: int = 100
+    ) -> Sequence[Project]:
+        """List every project (admin), newest first, with owner and outputs eager-loaded."""
+        result = await db.execute(
+            select(Project)
+            .options(selectinload(Project.user), selectinload(Project.output_files))
+            .order_by(Project.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
+
+    async def get_any(self, db: AsyncSession, project_id: uuid.UUID) -> Project | None:
+        """Get any project by id (admin), with owner and outputs eager-loaded."""
+        result = await db.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .options(selectinload(Project.user), selectinload(Project.output_files))
+        )
+        return result.scalars().first()
+
     async def count_for_user_since(
         self, db: AsyncSession, user_id: uuid.UUID, since: datetime
     ) -> int:

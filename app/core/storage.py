@@ -63,6 +63,15 @@ def get_signed_url(bucket: str, path: str, expires_in: int = 3600) -> str:
     return response["signedURL"]
 
 
+def download_file(bucket: str, path: str) -> bytes:
+    """Download an object's bytes (server-side, via the service_role key).
+
+    Used by the worker to pull a project's input audio before running the engine.
+    """
+    client = get_storage_client()
+    return client.storage.from_(bucket).download(path)
+
+
 def create_signed_upload_url(bucket: str, path: str) -> dict[str, str]:
     """Mint a one-time signed URL the client can upload *directly* to.
 

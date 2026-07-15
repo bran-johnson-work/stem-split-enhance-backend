@@ -15,7 +15,7 @@ from app.schemas.project import (
     UploadUrlRequest,
     UploadUrlResponse,
 )
-from app.services.project_service import project_service
+from app.services.project_service import FileTooLargeError, project_service
 
 router = APIRouter()
 
@@ -63,7 +63,10 @@ async def create_upload_url(
             filename=payload.filename,
             content_type=payload.content_type,
             project_id=payload.project_id,
+            declared_size_bytes=payload.file_size_bytes,
         )
+    except FileTooLargeError as exc:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if result is None:
@@ -100,7 +103,10 @@ async def create_project_upload_url(
             user_id=current_user.id,
             filename=payload.filename,
             content_type=payload.content_type,
+            declared_size_bytes=payload.file_size_bytes,
         )
+    except FileTooLargeError as exc:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if result is None:
@@ -125,6 +131,8 @@ async def complete_upload(
         project = await project_service.complete_upload(
             db, project_id=project_id, user_id=current_user.id
         )
+    except FileTooLargeError as exc:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if project is None:
