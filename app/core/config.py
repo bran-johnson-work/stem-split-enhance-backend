@@ -90,6 +90,21 @@ class Settings(BaseSettings):
     enable_enhancement: bool = True
     # How often an idle worker polls the queue for the next PENDING job.
     worker_poll_interval_seconds: float = 5.0
+
+    # --- Worker lease / stuck-job recovery (RCA-1) ---
+    # How often a busy worker refreshes its job's heartbeat while processing.
+    worker_heartbeat_interval_seconds: float = 15.0
+    # A PROCESSING job whose heartbeat is older than this is treated as abandoned
+    # (its worker died) and reclaimed by the reaper. Keep it comfortably larger
+    # than the heartbeat interval so a missed beat or two doesn't trigger a false
+    # reclaim of a job that's actually still running.
+    job_stale_timeout_seconds: float = 90.0
+    # How often each worker sweeps for abandoned jobs to reclaim.
+    reaper_interval_seconds: float = 30.0
+    # Run the reaper in-process on this worker. Safe to leave on for every worker
+    # (the sweep is atomic and locks rows SKIP LOCKED); set False on all but one
+    # if you'd rather a single worker own the sweep.
+    worker_run_reaper: bool = True
     # Scratch dir for a job's temp files; empty => the OS default temp dir.
     job_scratch_dir: str = ""
     # When set, completed stems are written to this local directory instead of

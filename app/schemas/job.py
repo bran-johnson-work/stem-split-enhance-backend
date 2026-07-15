@@ -40,6 +40,7 @@ class JobResponse(BaseModel):
     progress: float
     current_step: str
     error_message: str | None = None
+    attempts: int = 0
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime

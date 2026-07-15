@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import storage
 from app.core.config import Settings, get_settings
+from app.core.database import AsyncSessionLocal
 from app.engine.pipeline import FinalizedStem, separate_and_finalize
 from app.models.processing_job import JobStatus
 from app.models.project import ProjectStatus
@@ -22,6 +23,30 @@ from app.repositories.project_repository import project_repository
 from app.worker.progress import ProgressReporter
 
 logger = logging.getLogger(__name__)
+
+
+async def _heartbeat_loop(
+    job_id: uuid.UUID, stop: asyncio.Event, interval: float
+) -> None:
+    """Refresh the job's liveness stamp every ``interval`` seconds until stopped.
+
+    Runs on the event loop (which is free while the engine grinds inside
+    ``asyncio.to_thread``) in its *own* short-lived session, independent of the
+    main processing session. A transient DB error is logged and retried on the
+    next tick — a blip must not kill the job or the heartbeat. This is what lets
+    the reaper distinguish a live-but-slow worker from a dead one (RCA-1).
+    """
+    while not stop.is_set():
+        try:
+            async with AsyncSessionLocal() as hb_db:
+                await processing_job_repository.record_heartbeat(hb_db, job_id)
+                await hb_db.commit()
+        except Exception:
+            logger.warning("worker.heartbeat.failed id=%s", job_id, exc_info=True)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _set_progress(db: AsyncSession, job_id: uuid.UUID, progress: float, step: str) -> None:
@@ -69,6 +94,13 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
 
     scratch = Path(
         tempfile.mkdtemp(prefix=f"stemjob_{str(job_id)[:8]}_", dir=settings.job_scratch_dir or None)
+    )
+    # Heartbeat for the whole run so the reaper won't reclaim this job while it's
+    # genuinely progressing; stopped in ``finally`` once the job reaches a
+    # terminal state (or raises).
+    stop_heartbeat = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _heartbeat_loop(job_id, stop_heartbeat, settings.worker_heartbeat_interval_seconds)
     )
     try:
         # 1. Locate the input file (most recently uploaded to the project).
@@ -140,6 +172,8 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
         await db.rollback()
         await _mark_failed(db, job_id, project.id, f"{type(exc).__name__}: {exc}")
     finally:
+        stop_heartbeat.set()
+        await heartbeat
         shutil.rmtree(scratch, ignore_errors=True)
 
 
