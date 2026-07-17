@@ -57,7 +57,11 @@ async def test_create_project_requires_auth(client):
 
 async def test_create_project_upload_url_success(auth_client, monkeypatch, sample_user):
     project = _project(sample_user.id)
-    signed = {"storage_key": "key/song.wav", "url": "https://up.example", "token": "tok"}
+    signed = {
+        "storage_key": "key/song.wav",
+        "url": "https://up.example",
+        "fields": {"key": "key/song.wav", "Content-Type": "audio/wav"},
+    }
     monkeypatch.setattr(
         projects_module.project_service,
         "create_file_upload_url",
@@ -70,7 +74,7 @@ async def test_create_project_upload_url_success(auth_client, monkeypatch, sampl
     assert resp.status_code == 201
     body = resp.json()
     assert body["project_id"] == str(project.id)
-    assert body["token"] == "tok"
+    assert body["fields"]["key"] == "key/song.wav"
 
 
 async def test_create_project_upload_url_not_found(auth_client, monkeypatch):
@@ -134,7 +138,11 @@ async def test_delete_project_not_found(auth_client, monkeypatch):
 
 async def test_create_upload_url_success(auth_client, monkeypatch, sample_user):
     project = _project(sample_user.id)
-    signed = {"storage_key": "key/song.wav", "url": "https://up.example", "token": "tok"}
+    signed = {
+        "storage_key": "key/song.wav",
+        "url": "https://up.example",
+        "fields": {"key": "key/song.wav", "Content-Type": "audio/wav"},
+    }
     monkeypatch.setattr(
         projects_module.project_service,
         "create_upload_url",
@@ -148,7 +156,7 @@ async def test_create_upload_url_success(auth_client, monkeypatch, sample_user):
     body = resp.json()
     assert body["project_id"] == str(project.id)
     assert body["url"] == "https://up.example"
-    assert body["token"] == "tok"
+    assert body["fields"]["key"] == "key/song.wav"
 
 
 async def test_create_upload_url_rejects_bad_type(auth_client, monkeypatch):

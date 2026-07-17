@@ -44,28 +44,40 @@ info:
     ## The upload flow (presigned, direct-to-storage)
 
     Audio bytes are **never** streamed through this API. The API mints a one-time
-    presigned URL pointing at Supabase Storage; the client `PUT`s the file to
-    that URL, then calls `upload-complete` to finalise. Recommended sequence:
+    presigned **POST** targeting S3; the client posts the file straight there, then
+    calls `upload-complete` to finalise. Recommended sequence:
 
     1. `POST /api/v1/projects` — create a project (consumes monthly quota).
-    2. `POST /api/v1/projects/{project_id}/files/upload-url` — mint a presigned URL.
-    3. `PUT` the raw bytes to the returned `url` (direct to Supabase, not this API).
+    2. `POST /api/v1/projects/{project_id}/files/upload-url` — mint a presigned POST.
+    3. `POST` the bytes to the returned `url` (direct to S3, not this API).
     4. `POST /api/v1/projects/{project_id}/upload-complete` — verify & queue.
     5. `GET /api/v1/projects/{project_id}` / `.../input-url` — retrieve/preview.
 
     A one-shot shortcut, `POST /api/v1/projects/upload-url`, creates the project
-    **and** mints the URL in one call for the simple single-file case.
+    **and** mints the POST in one call for the simple single-file case.
 
     ### Uploading the bytes to storage
-    - The API returns Supabase's `url` (may be **relative**, e.g.
-      `/object/upload/sign/...`) plus a single-use `token`.
-    - If `url` is relative, prefix it with `<SUPABASE_URL>/storage/v1` to make it
-      absolute, then `PUT` the raw file bytes.
-    - Set the `Content-Type` header to the same value you declared when requesting
-      the URL. No `Authorization` header is needed for the storage `PUT` (the
-      token is embedded in the signed `url`).
-    - The token is single-use and expires (~2h). The bucket enforces the max file
-      size (**50 MB**) and allowed MIME types at `PUT` time.
+    - The API returns an absolute `url` plus a map of signed `fields`.
+    - Send `multipart/form-data` to `url`: every `fields` entry first, then the
+      `file` part **last** (S3 ignores any field after it). No `Authorization`
+      header — the signature travels in the fields.
+    - Don't set a `Content-Type` request header yourself; let your HTTP client set
+      the multipart boundary, and pass the declared audio type as the `file` part's
+      own content type.
+    - The signature expires (1h by default). S3 validates the signed policy and
+      returns `403` if it is violated — the policy pins the exact `Content-Type`
+      you declared and a size within **your plan's** `max_file_size_mb` (see
+      `GET /api/v1/plans`), so the ceiling differs per subscriber.
+
+    Example (curl):
+
+    ```
+    curl -X POST "$url" \
+      -F key=...            # each returned field, verbatim
+      -F Content-Type=audio/wav \
+      -F policy=...  -F x-amz-signature=... \
+      -F file=@vocals.wav   # must come last
+    ```
 
 servers:
   - url: http://localhost:8000
@@ -575,7 +587,8 @@ paths:
         consumed here (the project already accounts for it).
 
         Requesting a URL moves the project to `uploading`. After calling this,
-        `PUT` the bytes to the returned `url`, then finalise with
+        `POST` the bytes to the returned `url` as `multipart/form-data` (see
+        `UploadUrlResponse`), then finalise with
         `POST /api/v1/projects/{project_id}/upload-complete`.
       parameters:
         - $ref: '#/components/parameters/ProjectId'
@@ -1565,8 +1578,17 @@ components:
     UploadUrlResponse:
       type: object
       description: |
-        A one-time presigned URL to upload the file directly to Supabase Storage.
-      required: [project_id, storage_key, url, token]
+        A presigned **POST** to upload the file directly to S3.
+
+        Send `multipart/form-data` to `url` containing **every** entry of `fields`
+        first, then the `file` part last (S3 ignores anything after it). Do **not**
+        send an `Authorization` header — the signature is in the fields.
+
+        S3 enforces the signed policy itself and rejects the upload with `403` if
+        it is violated. The policy pins:
+          * `Content-Type` — must exactly match the `content_type` you requested.
+          * size — must be within your plan's `max_file_size_mb` (see `/plans`).
+      required: [project_id, storage_key, url, fields]
       properties:
         project_id:
           type: string
@@ -1575,22 +1597,33 @@ components:
         storage_key:
           type: string
           description: |
-            Object path within the input bucket
+            Object key within the input bucket
             (`<user_id>/<project_id>/<filename>`). Informational; the client does
             not need to construct it.
           example: "3fa85f64-.../a1b2.../vocals.wav"
         url:
           type: string
           description: |
-            Supabase signed upload URL to `PUT` the bytes to. **May be relative**
-            (e.g. `/object/upload/sign/...`); if so, prefix with
-            `<SUPABASE_URL>/storage/v1` to make it absolute.
-          example: "/object/upload/sign/audio-inputs/3fa85f64-.../vocals.wav?token=..."
-        token:
-          type: string
+            Absolute S3 endpoint to POST the multipart form to. Host varies by
+            environment (LocalStack in dev, AWS in production) — always use the
+            value returned here rather than constructing it.
+          example: "https://audio-inputs.s3.amazonaws.com/"
+        fields:
+          type: object
+          additionalProperties:
+            type: string
           description: |
-            Single-use upload token (also embedded in `url`). Expires (~2h by
-            default). No `Authorization` header is needed for the storage PUT.
+            Signed form fields. Copy each one into the multipart body verbatim,
+            before the `file` part; they are opaque and must not be modified.
+            Expires (1h by default).
+          example:
+            key: "3fa85f64-.../a1b2.../vocals.wav"
+            Content-Type: "audio/wav"
+            policy: "eyJleHBpcmF0aW9uIjoi..."
+            x-amz-algorithm: "AWS4-HMAC-SHA256"
+            x-amz-credential: "AKIA.../20260717/us-east-1/s3/aws4_request"
+            x-amz-date: "20260717T120000Z"
+            x-amz-signature: "9f0e..."
 
     ProjectFileResponse:
       type: object

@@ -49,10 +49,10 @@ async def create_upload_url(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    """Create a project and return a one-time URL to upload its audio directly.
+    """Create a project and return a presigned POST to upload its audio directly.
 
-    The client PUTs the file to the returned ``url`` (with ``token``), then calls
-    ``/{project_id}/upload-complete`` to finalise it.
+    The client POSTs the file to the returned ``url`` as multipart/form-data with
+    the returned ``fields``, then calls ``/{project_id}/upload-complete``.
     """
     project_name = (payload.name or "").strip() or (payload.filename or "Untitled project")
     try:
@@ -76,7 +76,7 @@ async def create_upload_url(
         project_id=project.id,
         storage_key=signed["storage_key"],
         url=signed["url"],
-        token=signed["token"],
+        fields=signed["fields"],
     )
 
 
@@ -91,10 +91,10 @@ async def create_project_upload_url(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    """Mint a presigned URL to upload a file into an existing project.
+    """Mint a presigned POST to upload a file into an existing project.
 
-    The client PUTs the file to the returned ``url`` (with ``token``), then calls
-    ``/{project_id}/upload-complete`` to finalise it.
+    The client POSTs the file to the returned ``url`` as multipart/form-data with
+    the returned ``fields``, then calls ``/{project_id}/upload-complete``.
     """
     try:
         result = await project_service.create_file_upload_url(
@@ -116,7 +116,7 @@ async def create_project_upload_url(
         project_id=project.id,
         storage_key=signed["storage_key"],
         url=signed["url"],
-        token=signed["token"],
+        fields=signed["fields"],
     )
 
 

@@ -2,6 +2,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -91,6 +92,25 @@ class ProjectService:
                 f"File exceeds your plan's {plan.max_file_size_mb} MB upload limit."
             )
 
+    def _max_upload_bytes(self, plan: Plan | None) -> int:
+        """The byte ceiling to bake into a presigned upload policy for this plan.
+
+        The plan is authoritative, mirroring :meth:`_enforce_file_size` and
+        :meth:`complete_upload`, which both gate on the plan alone — if this
+        disagreed with them, a user would get a URL they can't actually use (or
+        vice versa). ``settings.max_upload_size_bytes`` is only a fallback for when
+        the plan is unresolvable (the ``free`` row unseeded), because a presign
+        policy needs a concrete number where those two checks can simply no-op.
+
+        Note this is deliberately *not* clamped by ``max_upload_size_bytes``: that
+        setting existed to respect Supabase's global storage cap, and S3 has no
+        such platform ceiling. Clamping would silently cut every paid tier down to
+        the free-tier default.
+        """
+        if plan is None:
+            return get_settings().max_upload_size_bytes
+        return plan.max_file_size_mb * 1024 * 1024
+
     async def _enforce_project_quota(self, db: AsyncSession, user_id: uuid.UUID) -> None:
         """Reject creation when the user is at their plan's monthly project cap.
 
@@ -146,7 +166,7 @@ class ProjectService:
         filename: str,
         content_type: str,
         declared_size_bytes: int | None = None,
-    ) -> tuple[Project, dict[str, str]] | None:
+    ) -> tuple[Project, dict[str, Any]] | None:
         """Mint a presigned URL to upload a file into an *existing* project.
 
         The project must already exist and belong to the user (create it first
@@ -235,12 +255,17 @@ class ProjectService:
         content_type: str,
         project_id: uuid.UUID | None = None,
         declared_size_bytes: int | None = None,
-    ) -> tuple[Project, dict[str, str]] | None:
-        """Create a project and mint a presigned URL for a *direct* client upload.
+    ) -> tuple[Project, dict[str, Any]] | None:
+        """Create a project and mint a presigned POST for a *direct* client upload.
 
-        The bytes go client -> Supabase; the API only validates the declared
-        content type and hands back a one-time upload URL. The final file
-        metadata is recorded later by :meth:`complete_upload`.
+        The bytes go client -> S3; the API only validates the declared content
+        type and hands back a one-time upload POST. The final file metadata is
+        recorded later by :meth:`complete_upload`.
+
+        The POST is minted *per plan*: the policy's ``content-length-range`` is the
+        caller's own ``max_file_size_mb`` (see :meth:`_max_upload_bytes`), so S3
+        rejects an over-plan upload itself rather than accepting the bytes and
+        having us delete them afterwards.
 
         When ``project_id`` is given the URL targets an existing project (adding
         another file to it); otherwise a new project is created after a
@@ -260,9 +285,13 @@ class ProjectService:
         if content_type not in settings.allowed_audio_content_type_set:
             raise ValueError(f"Unsupported audio content type: {content_type or 'unknown'}")
 
+        # The plan is always resolved now, not just when the client declared a
+        # size: S3 has no bucket-level size cap, so the user's plan limit has to be
+        # baked into the presign policy for storage to enforce it at upload time.
+        plan = await self._effective_plan(db, user_id)
         if declared_size_bytes is not None:
-            plan = await self._effective_plan(db, user_id)
             self._enforce_file_size(plan, declared_size_bytes)
+        max_size_bytes = self._max_upload_bytes(plan)
 
         original_filename = _sanitize_filename(filename)
 
@@ -286,6 +315,9 @@ class ProjectService:
             storage.create_signed_upload_url,
             storage.BUCKET_INPUTS,
             storage_key,
+            content_type=content_type,
+            max_size_bytes=max_size_bytes,
+            expires_in=settings.s3_upload_url_expire_seconds,
         )
         await db.commit()
         await db.refresh(project)
@@ -319,10 +351,11 @@ class ProjectService:
                 return project  # nothing new in storage but already recorded — idempotent
             raise ValueError("No uploaded file found for this project")
 
-        # Authoritative file-size enforcement: Supabase's bucket limit is global
-        # (can't tell plans apart), so a user under the bucket ceiling but over
-        # *their* plan limit lands the bytes anyway. Reject and purge them here,
-        # reading the real stored size, before recording anything.
+        # Authoritative file-size enforcement, on the real stored bytes. The
+        # presign policy's content-length-range already rejects an oversize upload
+        # at S3, but a URL minted before a plan downgrade (or against a stale
+        # ceiling) can still outlive that limit — so re-check and purge here
+        # before recording anything.
         plan = await self._effective_plan(db, user_id)
         limit_bytes = plan.max_file_size_mb * 1024 * 1024 if plan is not None else None
         if limit_bytes is not None:

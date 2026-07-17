@@ -40,7 +40,9 @@ async def test_create_upload_url_success(service, fake_db, monkeypatch):
     project = _project(user_id)
     service.repository.create.return_value = project
 
-    signed_mock = MagicMock(return_value={"url": "https://up.example", "token": "tok", "path": "p"})
+    signed_mock = MagicMock(
+        return_value={"url": "https://up.example", "fields": {"key": "k"}, "path": "p"}
+    )
     monkeypatch.setattr(
         project_service_module.storage, "create_signed_upload_url", signed_mock
     )
@@ -56,10 +58,73 @@ async def test_create_upload_url_success(service, fake_db, monkeypatch):
     assert result_project is project
     assert signed["storage_key"] == f"{user_id}/{project.id}/song.wav"
     assert signed["url"] == "https://up.example"
-    assert signed["token"] == "tok"
-    # The signed URL is scoped to the user/project-namespaced key.
+    assert signed["fields"] == {"key": "k"}
+    # The signed POST is scoped to the user/project-namespaced key.
     assert signed_mock.call_args.args[1] == f"{user_id}/{project.id}/song.wav"
     fake_db.commit.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "plan_mb",
+    [
+        20,  # free: below the MAX_UPLOAD_SIZE_BYTES fallback (50 MB)
+        100,  # creator: above it — must NOT be clamped down to the fallback
+        500,  # studio
+    ],
+)
+async def test_presign_policy_carries_the_users_own_plan_limit(
+    service, fake_db, monkeypatch, plan_mb
+):
+    """S3 has no bucket-level limit, so the presign must carry the plan's own cap.
+
+    The plan is authoritative in both directions: MAX_UPLOAD_SIZE_BYTES is a
+    fallback, not a ceiling, so a paid tier above it is passed through intact.
+    """
+    user_id = uuid.uuid4()
+    service.repository.create.return_value = _project(user_id)
+    service._effective_plan = AsyncMock(return_value=SimpleNamespace(max_file_size_mb=plan_mb))
+
+    signed_mock = MagicMock(return_value={"url": "u", "fields": {}, "path": "p"})
+    monkeypatch.setattr(
+        project_service_module.storage, "create_signed_upload_url", signed_mock
+    )
+
+    await service.create_upload_url(
+        fake_db,
+        user_id=user_id,
+        name="Song",
+        filename="song.wav",
+        content_type="audio/wav",
+    )
+
+    kwargs = signed_mock.call_args.kwargs
+    assert kwargs["max_size_bytes"] == plan_mb * 1024 * 1024
+    assert kwargs["content_type"] == "audio/wav"
+
+
+async def test_presign_policy_falls_back_to_settings_when_plan_unresolvable(
+    service, fake_db, monkeypatch
+):
+    """No plan row (free unseeded) still needs a concrete number for the policy."""
+    user_id = uuid.uuid4()
+    service.repository.create.return_value = _project(user_id)
+    service._effective_plan = AsyncMock(return_value=None)
+
+    signed_mock = MagicMock(return_value={"url": "u", "fields": {}, "path": "p"})
+    monkeypatch.setattr(
+        project_service_module.storage, "create_signed_upload_url", signed_mock
+    )
+
+    await service.create_upload_url(
+        fake_db,
+        user_id=user_id,
+        name="Song",
+        filename="song.wav",
+        content_type="audio/wav",
+    )
+
+    expected = project_service_module.get_settings().max_upload_size_bytes
+    assert signed_mock.call_args.kwargs["max_size_bytes"] == expected
 
 
 async def test_create_upload_url_rejects_bad_type(service, fake_db):
@@ -223,7 +288,9 @@ async def test_create_file_upload_url_delegates_with_project(service, fake_db, m
     service.repository.get_for_user.return_value = project
     service.repository.update.return_value = project
 
-    signed_mock = MagicMock(return_value={"url": "https://up.example", "token": "tok", "path": "p"})
+    signed_mock = MagicMock(
+        return_value={"url": "https://up.example", "fields": {"key": "k"}, "path": "p"}
+    )
     monkeypatch.setattr(project_service_module.storage, "create_signed_upload_url", signed_mock)
 
     result = await service.create_file_upload_url(
