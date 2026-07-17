@@ -11,10 +11,24 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     log_level: str = "INFO"
 
-    # Supabase
+    # Supabase (Postgres only — object storage now lives on S3, see below)
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
+
+    # --- AWS S3 object storage ---
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    # Empty => real AWS. Set to an S3-compatible endpoint to develop without an
+    # AWS account (LocalStack defaults to http://localhost:4566).
+    aws_endpoint_url: str = ""
+    # Real S3 bucket names are globally unique across all AWS accounts, so a real
+    # deploy will need to suffix these.
+    s3_bucket_inputs: str = "audio-inputs"
+    s3_bucket_stems: str = "audio-stems"
+    # Lifetime of a presigned upload POST. Downloads pass expires_in explicitly.
+    s3_upload_url_expire_seconds: int = 3600
 
     # PostgreSQL — direct URL for Alembic migrations (port 5432)
     database_url: str = ""
@@ -41,7 +55,12 @@ class Settings(BaseSettings):
     signup_rate_limit_window_seconds: int = 3600
 
 
-    max_upload_size_bytes: int = 50 * 1024 * 1024  # 50 MB (Supabase Free ceiling)
+    # Fallback upload ceiling, used ONLY when a user's plan can't be resolved (the
+    # 'free' row unseeded). Normally the plan's own max_file_size_mb is what gets
+    # baked into the presign policy — see ProjectService._max_upload_bytes.
+    # This is not a clamp: it was sized to Supabase's Free-plan storage cap, and
+    # capping plans with it would cut every paid tier down to 50 MB.
+    max_upload_size_bytes: int = 50 * 1024 * 1024
     allowed_audio_content_types: str = (
         "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave,"
         "audio/flac,audio/x-flac,audio/mp4,audio/aac,audio/ogg,audio/webm"
@@ -119,10 +138,11 @@ class Settings(BaseSettings):
     # Scratch dir for a job's temp files; empty => the OS default temp dir.
     job_scratch_dir: str = ""
     # When set, completed stems are written to this local directory instead of
-    # being uploaded to the Supabase stems bucket — a workaround for the Free
-    # plan's 50 MB object cap, which rejects large WAV stems with HTTP 413. The
-    # on-disk layout mirrors the bucket: <dir>/<user_id>/<project_id>/stems/<name>.wav.
-    # Empty => upload to Supabase Storage as usual.
+    # being uploaded to the stems bucket. The on-disk layout mirrors the bucket:
+    # <dir>/<user_id>/<project_id>/stems/<name>.wav. Empty => upload as usual.
+    # This began as a workaround for Supabase Free's 50 MB object cap rejecting
+    # large WAV stems with HTTP 413; S3 has no such cap, so on S3 it's now only
+    # useful for keeping stems off object storage entirely (e.g. offline dev).
     stems_local_dir: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

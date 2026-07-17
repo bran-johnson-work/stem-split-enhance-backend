@@ -3,14 +3,17 @@
 Walks the full happy path a real client follows:
 
     login -> POST /projects -> POST /projects/{id}/files/upload-url
-          -> PUT bytes straight to Supabase -> POST /projects/{id}/upload-complete
+          -> POST bytes straight to S3 -> POST /projects/{id}/upload-complete
           -> GET /projects/{id} + GET /projects/{id}/input-url
 
-Unlike the pytest suite (which is network-free and fully mocked), this makes
-real HTTP calls to a running API *and* to Supabase Storage, so it needs the app
-running and valid Supabase credentials. Use it to sanity-check the flow by hand.
+Unlike the pytest suite (which is network-free and fully mocked), this makes real
+HTTP calls to a running API *and* to S3, so it needs the app running and working
+AWS credentials (or LocalStack up). Use it to sanity-check the flow by hand.
 
-    # start the API first:  python -m app.main
+    # start LocalStack + the API first:
+    #   docker run --rm -p 4566:4566 localstack/localstack
+    #   python -m scripts.init_storage
+    #   python -m app.main
     python -m scripts.test_presign_upload ~/Desktop/PoC/audio1_stems/vocals.wav \
         --email tester@example.com --password 'Passw0rd!' --register
 
@@ -45,13 +48,6 @@ def _guess_content_type(path: Path, override: str | None) -> str:
         return _CONTENT_TYPES[ext]
     guessed, _ = mimetypes.guess_type(str(path))
     return (guessed or "application/octet-stream").lower()
-
-
-def _resolve_put_url(signed_url: str, supabase_url: str) -> str:
-    """The API hands back Supabase's ``signed_url``; make it absolute if needed."""
-    if signed_url.startswith("http://") or signed_url.startswith("https://"):
-        return signed_url
-    return f"{supabase_url.rstrip('/')}/storage/v1{signed_url}"
 
 
 def _login(client: httpx.Client, base: str, email: str, password: str) -> str:
@@ -94,11 +90,12 @@ def run(args: argparse.Namespace) -> int:
 
     content_type = _guess_content_type(file_path, args.content_type)
     base = args.base_url.rstrip("/")
-    supabase_url = args.supabase_url or get_settings().supabase_url
+    settings = get_settings()
+    endpoint = settings.aws_endpoint_url or f"AWS S3 ({settings.aws_region})"
     project_name = args.name or file_path.stem
 
     print(f"[info] file={file_path.name} ({len(data)} bytes) content_type={content_type}")
-    print(f"[info] api={base}  supabase={supabase_url}")
+    print(f"[info] api={base}  s3={endpoint}")
 
     auth: dict[str, str]
     with httpx.Client(timeout=60.0) as client:
@@ -129,15 +126,20 @@ def run(args: argparse.Namespace) -> int:
             print(f"[error] presign failed ({resp.status_code}): {resp.text}")
             return 1
         signed = resp.json()
-        put_url = _resolve_put_url(signed["url"], supabase_url)
-        print(f"[ok] got presigned URL for key={signed['storage_key']}")
+        print(f"[ok] got presigned POST for key={signed['storage_key']}")
 
-        # 4) upload the bytes DIRECTLY to Supabase (not through the API) --
-        put = client.put(put_url, content=data, headers={"Content-Type": content_type})
-        if put.status_code not in (200, 201):
-            print(f"[error] storage PUT failed ({put.status_code}): {put.text}")
+        # 4) upload the bytes DIRECTLY to S3 (not through the API) --------
+        # A presigned POST is multipart/form-data: every signed field first, then
+        # the file part last. S3 enforces the policy's size/content-type here.
+        upload = client.post(
+            signed["url"],
+            data=signed["fields"],
+            files={"file": (file_path.name, data, content_type)},
+        )
+        if upload.status_code not in (200, 201, 204):
+            print(f"[error] storage POST failed ({upload.status_code}): {upload.text}")
             return 1
-        print(f"[ok] uploaded bytes to storage ({put.status_code})")
+        print(f"[ok] uploaded bytes to storage ({upload.status_code})")
 
         # 5) finalise: the API verifies the object landed and queues it ---
         resp = client.post(
@@ -188,11 +190,6 @@ def main() -> None:
     parser.add_argument("--name", help="project name (defaults to the file stem)")
     parser.add_argument(
         "--content-type", help="override the declared content type (else auto-detected)"
-    )
-    parser.add_argument(
-        "--supabase-url",
-        help="Supabase project URL for the storage PUT "
-        "(defaults to SUPABASE_URL from .env; only needed if the signed URL is relative)",
     )
     args = parser.parse_args()
 
