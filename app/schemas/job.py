@@ -52,7 +52,7 @@ class JobResponse(BaseModel):
 class StemDownload(BaseModel):
     """A download reference for one output stem.
 
-    Normally a short-lived Supabase signed URL (``expires_in`` seconds). When the
+    Normally a short-lived S3 signed URL (``expires_in`` seconds). When the
     worker saves stems to a local folder (``STEMS_LOCAL_DIR``), this is a ``file://``
     URI pointing at the file on disk and ``expires_in`` is 0.
     """

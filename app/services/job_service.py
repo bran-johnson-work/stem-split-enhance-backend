@@ -99,7 +99,7 @@ class JobService:
         downloads: list[StemDownload] = []
         for out in outputs:
             if local_dir:
-                # Stems live on local disk (Supabase upload bypassed). Hand back a
+                # Stems live on local disk (the S3 upload was bypassed). Hand back a
                 # file:// URI to the file rather than a signed URL; it never expires.
                 url = (Path(local_dir) / out.storage_key).resolve().as_uri()
                 expires = 0
