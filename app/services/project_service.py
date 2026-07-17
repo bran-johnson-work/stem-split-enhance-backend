@@ -53,24 +53,30 @@ class ProjectService:
     ) -> tuple[Plan | None, datetime]:
         """Resolve the user's effective plan and the start of the current usage window.
 
-        An ACTIVE/TRIALING subscription with a known period uses that plan and its
-        billing-period start; otherwise the user is on the ``free`` plan and the
-        window is the current calendar month (UTC). One subscription lookup feeds
-        both the project-quota gate and the file-size gate.
+        An ACTIVE/TRIALING subscription's plan is authoritative; otherwise the user
+        is on the ``free`` plan. The usage window is the subscription's billing
+        period when known, else the current calendar month (UTC). One subscription
+        lookup feeds both the project-quota gate and the file-size gate.
         """
         subscription = await subscription_repository.get_for_user(db, user_id)
         now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+        # A paid subscriber's plan applies even when the billing period is unknown:
+        # ``current_period_start`` only scopes the counting window, not *which* plan
+        # is in force. It is routinely NULL — newer Stripe API versions drop it from
+        # the subscription object (it lives on the items now), and a manually-created
+        # subscription may never set it. Gating the plan on it silently downgraded
+        # such a subscriber to the ``free`` cap; fall the *window* back instead.
         if (
             subscription is not None
             and subscription.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING)
-            and subscription.current_period_start is not None
+            and subscription.plan is not None
         ):
-            return subscription.plan, subscription.current_period_start
+            return subscription.plan, subscription.current_period_start or month_start
 
         plan = await plan_repository.get_by_name(db, DEFAULT_PLAN_NAME)
-        window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return plan, window_start
+        return plan, month_start
 
     async def _effective_plan(self, db: AsyncSession, user_id: uuid.UUID) -> Plan | None:
         """The user's effective plan (active subscription's plan, else ``free``)."""

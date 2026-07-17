@@ -457,3 +457,46 @@ async def test_quota_uses_active_subscription_window(fake_db, monkeypatch):
         await svc._enforce_project_quota(fake_db, uuid.uuid4())
     # Counted against the billing-period start, not the calendar month.
     assert svc.repository.count_for_user_since.call_args.args[2] == now
+
+
+async def test_quota_unlimited_plan_with_null_period_stays_unlimited(fake_db, monkeypatch):
+    # Regression: an ACTIVE unlimited (Studio) subscription whose billing period is
+    # unknown (current_period_start is NULL — as Stripe now omits it, and manually
+    # created rows leave it) must NOT fall back to the free cap.
+    subscription = SimpleNamespace(
+        status=SubscriptionStatus.ACTIVE,
+        current_period_start=None,
+        plan=SimpleNamespace(max_projects_per_month=None),
+    )
+    # free_plan would block at 3, but the unlimited plan must win.
+    svc = _quota_service(
+        monkeypatch,
+        subscription=subscription,
+        plan=SimpleNamespace(max_projects_per_month=3),
+        used=999,
+    )
+    await svc._enforce_project_quota(fake_db, uuid.uuid4())  # no raise
+    svc.repository.count_for_user_since.assert_not_called()
+
+
+async def test_quota_capped_plan_with_null_period_uses_month_window(fake_db, monkeypatch):
+    # An active capped plan with a NULL period still enforces its own limit,
+    # counted over the calendar month rather than dropping to the free plan.
+    subscription = SimpleNamespace(
+        status=SubscriptionStatus.ACTIVE,
+        current_period_start=None,
+        plan=SimpleNamespace(max_projects_per_month=50),
+    )
+    svc = _quota_service(
+        monkeypatch,
+        subscription=subscription,
+        plan=SimpleNamespace(max_projects_per_month=3),
+        used=50,
+    )
+    with pytest.raises(ValueError, match="reached \\(50\\)"):
+        await svc._enforce_project_quota(fake_db, uuid.uuid4())
+    # Window falls back to the start of the current UTC month.
+    now = datetime.now(timezone.utc)
+    assert svc.repository.count_for_user_since.call_args.args[2] == now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
