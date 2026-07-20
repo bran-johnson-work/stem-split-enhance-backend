@@ -6,6 +6,10 @@ python-dotenv>=1.0,<2.0
 # EmailStr validation in Pydantic schemas
 email-validator>=2.0,<3.0
 
+# JWT signing/verification (app.core.security, app.api.dependencies). Password
+# hashing is stdlib hashlib PBKDF2 — no passlib/python-jose.
+PyJWT>=2.8,<3.0
+
 # Database
 sqlalchemy[asyncio]>=2.0,<3.0
 asyncpg>=0.30

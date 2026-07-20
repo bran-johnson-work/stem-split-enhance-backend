@@ -1,0 +1,65 @@
+
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+
+# ---- Stage 1: builder — resolve deps into a self-contained venv ----
+FROM ${PYTHON_IMAGE} AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# A venv we can lift wholesale into the runtime stage (keeps the copy self-contained
+# and independent of the system site-packages).
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+COPY requirements.txt ./
+# Every API dependency ships a cp311 manylinux/pure-python wheel (asyncpg, uvicorn's
+# uvloop/httptools/watchfiles, etc.), so no compiler/build-essential is needed here.
+RUN pip install -r requirements.txt
+
+# ---- Stage 2: runtime — minimal final image, no build tooling ----
+FROM ${PYTHON_IMAGE} AS runtime
+
+# PYTHONDONTWRITEBYTECODE keeps the layer free of .pyc; PYTHONUNBUFFERED streams logs.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# Copy the ready-built venv from the builder — the only heavy artifact we need.
+COPY --from=builder /opt/venv /opt/venv
+
+# API-only import closure (verified): main + api + the shared core/models/
+# repositories/schemas/services layers. The engine/worker packages (app/engine,
+# app/worker) carry the torch/demucs stack and are NOT imported by the API, so they
+# are intentionally excluded from this image. Add a package here if the API grows a
+# new import. Alembic is included so `alembic upgrade head` can be run as a one-off /
+# init job; migrations are intentionally NOT run at container start.
+COPY app/main.py ./app/main.py
+COPY app/api ./app/api
+COPY app/core ./app/core
+COPY app/models ./app/models
+COPY app/repositories ./app/repositories
+COPY app/schemas ./app/schemas
+COPY app/services ./app/services
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
+
+# Drop root.
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+# Liveness against the app's own /health route. Uses stdlib urllib so the image
+# needs no extra packages (curl/wget) — keeps it minimal.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"
+
+# Production server: no --reload. Scale out with replicas rather than in-process
+# workers so each process stays observable; add `--workers N` if you prefer.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

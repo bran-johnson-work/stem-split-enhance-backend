@@ -32,7 +32,29 @@ alembic revision --autogenerate -m "description"
 alembic upgrade head
 ```
 
-Environment variables are loaded from `.env` (see `.env.example`). Key ones: `DATABASE_URL` (direct, port 5432 — used only by Alembic), `DATABASE_URL_POOLED` (PgBouncer, port 6543 — used by the app), `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` (storage), `SECRET_KEY` (JWT signing — **required in non-local envs; the app refuses to boot without it** via `Settings.assert_production_ready()` in `app/main.py`).
+Environment variables are loaded from `.env` (see `.env.example`). Key ones: the **`POSTGRES_*` component set** (`POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_USERNAME` / `POSTGRES_PASSWORD` / `POSTGRES_DATABASE`, plus `POSTGRES_SSL` for RDS TLS and `POSTGRES_LOG` for SQL echo) — when `POSTGRES_HOST` is set the app **and** Alembic build their async URL from these (see `Settings.active_database_url` / `migration_database_url` / `asyncpg_connect_args`); the legacy `DATABASE_URL` (direct, 5432) / `DATABASE_URL_POOLED` (PgBouncer, 6543) strings are only a fallback when `POSTGRES_HOST` is blank. `SECRET_KEY` (JWT signing — **required in non-local envs; the app refuses to boot without it** via `Settings.assert_production_ready()` in `app/main.py`). Object storage config is `AWS_*` / `S3_*` (see the S3 section); the old `SUPABASE_*` keys are vestigial.
+
+## Containers
+
+Two images, built from this one repo, deployed separately:
+
+- **`Dockerfile.api`** — the FastAPI app (`app.main:app` via uvicorn). Lean stack (no torch); multi-stage build into `/opt/venv`, `python:3.11-slim` runtime (from ECR Public — see below), non-root, stdlib `/health` HEALTHCHECK. COPYs only the API import closure: `main.py`, `api`, `core`, `models`, `repositories`, `schemas`, `services`.
+- **`Dockerfile.worker`** — the separation worker (`python -m app.worker`). Carries the torch/demucs stack; also multi-stage/slim/non-root. COPYs only the worker import closure: `core`, `models`, `repositories`, `schemas`, `engine`, `worker` (no `api`/`services`/`main.py`).
+
+The two COPY sets are the **verified** import closures (`app` is a PEP 420 namespace package, no `app/__init__.py`). When a package gains a new cross-layer import, update the relevant Dockerfile's COPY list. `.dockerignore` keeps the build context minimal and, crucially, excludes `.env`.
+
+**Base images come from ECR Public, not Docker Hub** — anonymous Docker Hub pulls are rate limited (100/6h per IP), which breaks CI and fresh hosts. Both Dockerfiles use `ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.11-slim`, AWS's [Docker Official Images mirror](https://gallery.ecr.aws/docker/library/python), which serves the **identical manifest digest** as `docker.io/library/python:3.11-slim` — a registry swap, not an image change. Pulls are free and unmetered from inside an AWS region (10 pulls/sec); from outside, 500 GB/month anonymous. Override the registry with `--build-arg PYTHON_IMAGE=...`.
+
+Neither Dockerfile carries a `# syntax=` directive, deliberately: it would pull the BuildKit frontend from Docker Hub on every build (the exact limit being avoided) and has no ECR Public mirror. Nothing in either file needs a non-default frontend — don't re-add it without a reason.
+
+**CPU vs GPU worker.** The worker defaults to CPU wheels. For an AWS GPU host, build the CUDA variant by overriding the torch wheel index to match the instance driver, then run with the NVIDIA runtime and require the GPU:
+```bash
+docker build -f Dockerfile.worker \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+  -t stem-worker:gpu .
+docker run --gpus all -e WORKER_DEVICE=cuda ...  stem-worker:gpu
+```
+torch 2.11 ships on **cu126 / cu128** (not cu121/cu124, which stopped at torch 2.5) — pick the index matching the host driver. Modern torch CUDA wheels bundle the CUDA runtime, so a `slim` base + host driver (via `nvidia-container-toolkit`) suffices — no `nvidia/cuda` devel base needed. **Device selection** is `WORKER_DEVICE` (`Settings.worker_device`, honored in `app/engine/dsp.py::_pick_device`): `auto` picks CUDA > MPS > CPU; an explicit `cuda`/`cuda:N`/`mps` is *required* and raises at startup if unavailable (so a rented GPU box never silently falls back to CPU).
 
 ## Architecture
 
@@ -63,8 +85,8 @@ api/v1/endpoints/*.py  → services/*.py  → repositories/*.py  → models/*.py
 - Repository/service instances are module-level singletons, not constructed per-request or injected via `Depends`.
 - Use timezone-aware UUID primary keys and the `TimestampMixin` for any new table.
 - Enum-like status columns (`ProjectStatus`, `JobStatus`, `SubscriptionStatus`) are Python `str` enums stored via SQLAlchemy `Enum`.
-- Migrations are async (see `alembic/env.py`); when connecting through the Supabase pooler, `prepared_statement_cache_size=0` must be appended to the URL (already handled automatically in `env.py`).
-- **Transaction pooler + asyncpg:** the app's engine (`app/core/database.py`) connects through Supabase's transaction pooler (port 6543), which cannot support asyncpg's default server-side prepared statements. `_build_connect_args()` disables the statement caches and assigns unique prepared-statement names for `pooler.supabase.com` URLs — do not remove this, or reused pooled connections will fail with `DuplicatePreparedStatementError`.
+- Migrations are async (see `alembic/env.py`); it builds its URL from `Settings.migration_database_url` (RDS components, or the legacy direct URL) and passes `connect_args={"ssl": True}` when `POSTGRES_SSL` is set. On the legacy Supabase-pooler fallback, `prepared_statement_cache_size=0` is appended to the URL automatically.
+- **asyncpg connect args are centralized** in `Settings.asyncpg_connect_args()` (shared by `app/core/database.py` and Alembic). On AWS RDS it just carries TLS (`ssl=True` when `POSTGRES_SSL`). The Supabase *transaction pooler* (PgBouncer, port 6543) cannot support asyncpg's default server-side prepared statements, so for `pooler.supabase.com` URLs the helper disables the statement caches and assigns unique prepared-statement names — do not remove this branch, or reused pooled connections will fail with `DuplicatePreparedStatementError`. A direct RDS connection (or RDS Proxy, which pins per session) doesn't need it.
 - `ruff` is configured for `E`, `F`, `I` rule sets with a 100-char line length (`pyproject.toml`).
 
 ### Reference skills
