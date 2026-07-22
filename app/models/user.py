@@ -11,6 +11,7 @@ from app.models.base import Base, TimestampMixin, new_uuid
 if TYPE_CHECKING:
     from app.models.billing_event import BillingEvent
     from app.models.project import Project
+    from app.models.refresh_token import RefreshToken
     from app.models.subscription import Subscription
 
 
@@ -44,4 +45,7 @@ class User(Base, TimestampMixin):
     )
     billing_events: Mapped[list["BillingEvent"]] = relationship(
         "BillingEvent", back_populates="user"
+    )
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
