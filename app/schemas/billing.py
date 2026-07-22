@@ -81,6 +81,27 @@ class CancelRequest(BaseModel):
     immediate: bool = False
 
 
+class InvoiceResponse(BaseModel):
+    """One billing receipt, sourced live from Stripe.
+
+    Amounts are **dollars** (Stripe reports cents; the service converts) so the
+    client formats them the same as every other price. The two URLs are Stripe's
+    own: ``hosted_invoice_url`` is a full receipt page, ``invoice_pdf`` a direct
+    PDF download — both short-lived, so they are fetched on demand, never stored.
+    """
+
+    id: str
+    # When the invoice was finalised, ISO-8601.
+    created_at: datetime
+    amount: float
+    currency: str
+    # Normalised to the set the UI renders: paid | open | failed.
+    status: str
+    description: str | None
+    hosted_invoice_url: str | None
+    invoice_pdf: str | None
+
+
 # --- Internal persistence schemas (feed BaseRepository create/update) ------
 
 
