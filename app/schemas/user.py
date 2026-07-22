@@ -41,6 +41,25 @@ class UserResponse(UserBase):
 class Token(BaseModel):
     access_token: str
     token_type: str
+    # Opaque, rotating. Absent only in flows that deliberately don't start a
+    # long-lived session.
+    refresh_token: str | None = None
+    # Access-token lifetime in seconds, so the client can refresh *before* it
+    # expires instead of waiting for a 401 it could have avoided.
+    expires_in: int | None = None
+
+
+class RefreshRequest(BaseModel):
+    """Exchange a refresh token for a fresh access token (and a new refresh)."""
+
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
+    """Optional logout body. Sending the refresh token ends the whole session,
+    not just the presented access token."""
+
+    refresh_token: str | None = None
 
 
 class TokenPayload(BaseModel):
