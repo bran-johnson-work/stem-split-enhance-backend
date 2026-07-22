@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     jwt_audience: str = "ai-audio-stem-api-clients"
     jwt_email_verification_audience: str = "ai-audio-stem-api-email-verification"
     access_token_expire_minutes: int = 30
+    # Refresh-token lifetime. The access token stays short (a stolen one expires
+    # fast); this is what actually keeps a user signed in, since the client
+    # silently exchanges it for a new access token. 30 days of inactivity ends
+    # the session — every refresh issues a new token, so an active user's window
+    # keeps moving forward.
+    refresh_token_expire_days: int = 30
 
     # PBKDF2-HMAC-SHA256. OWASP-recommended floor is ~600k.
     pbkdf2_iterations: int = 600_000
