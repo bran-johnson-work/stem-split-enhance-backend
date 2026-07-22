@@ -12,6 +12,7 @@ from app.schemas.billing import (
     CancelRequest,
     CheckoutRequest,
     CheckoutResponse,
+    InvoiceResponse,
     PlanResponse,
     PortalResponse,
     SubscriptionResponse,
@@ -45,6 +46,23 @@ async def get_my_subscription(
     subscription row, so the client always receives a plan to display.
     """
     return await billing_service.get_subscription_view(db, current_user.id)
+
+
+@router.get("/invoices", response_model=list[InvoiceResponse])
+async def list_invoices(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """The caller's invoices, read live from Stripe.
+
+    Empty for a free user or anyone who never completed checkout — that's a
+    normal state, not an error. Only a Stripe outage surfaces (502).
+    """
+    try:
+        return await billing_service.list_invoices(db, current_user.id)
+    except StripeError:
+        logger.exception("Stripe invoice listing failed for user %s", current_user.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
