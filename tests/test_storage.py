@@ -92,6 +92,32 @@ def test_presigned_post_policy_carries_size_and_type_conditions(s3):
     assert {"Content-Type": "audio/wav"} in policy["conditions"]
 
 
+def test_ensure_bucket_sets_cors_for_browser_uploads(s3):
+    """Real S3 blocks the browser's direct presigned POST without a bucket CORS policy."""
+    client = storage.get_storage_client()
+
+    rules = client.get_bucket_cors(Bucket=BUCKET)["CORSRules"]
+
+    assert len(rules) == 1
+    rule = rules[0]
+    assert "POST" in rule["AllowedMethods"]
+    assert "GET" in rule["AllowedMethods"]
+    # Default settings.cors_origins is "*", so that is what gets allowed here.
+    assert rule["AllowedOrigins"] == ["*"]
+
+
+def test_put_bucket_cors_is_a_noop_without_origins(s3):
+    from botocore.exceptions import ClientError
+
+    client = storage.get_storage_client()
+    client.delete_bucket_cors(Bucket=BUCKET)
+
+    storage.put_bucket_cors(BUCKET, [])  # no origins configured
+
+    with pytest.raises(ClientError):  # still no CORS config on the bucket
+        client.get_bucket_cors(Bucket=BUCKET)
+
+
 def test_delete_file(s3):
     storage.upload_file(BUCKET, f"{PREFIX}/song.wav", b"a", "audio/wav")
 

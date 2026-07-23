@@ -108,6 +108,48 @@ def ensure_bucket(bucket: str, *, public: bool = False) -> None:
         except ClientError:  # pragma: no cover - not all S3 clones implement this
             logger.warning("Could not set public access block on %s", bucket)
 
+    # Browser uploads go straight to S3 via a presigned POST, and downloads/playback
+    # hit presigned GET URLs — both are cross-origin requests from the frontend, so
+    # the *bucket* needs a CORS policy or real S3 blocks them. (LocalStack doesn't
+    # enforce CORS, which is why this only bites in production.)
+    put_bucket_cors(bucket, settings.cors_origin_list)
+
+
+def put_bucket_cors(bucket: str, origins: list[str]) -> None:
+    """Configure the bucket's CORS policy for direct browser uploads/downloads.
+
+    ``origins`` is the app's configured origin allowlist (``CORS_ORIGINS``); with
+    none configured there is nothing to allow, so this is a no-op. ``POST``/``PUT``
+    cover the presigned-upload POST, ``GET``/``HEAD`` cover presigned downloads and
+    ``<audio>`` playback; ``ETag`` is exposed so the client can read it back.
+    """
+    if not origins:
+        logger.warning(
+            "No CORS_ORIGINS configured; skipping bucket CORS on %s "
+            "(browser uploads will be blocked by real S3)",
+            bucket,
+        )
+        return
+
+    client = get_storage_client()
+    try:
+        client.put_bucket_cors(
+            Bucket=bucket,
+            CORSConfiguration={
+                "CORSRules": [
+                    {
+                        "AllowedMethods": ["POST", "PUT", "GET", "HEAD"],
+                        "AllowedOrigins": origins,
+                        "AllowedHeaders": ["*"],
+                        "ExposeHeaders": ["ETag"],
+                        "MaxAgeSeconds": 3600,
+                    }
+                ]
+            },
+        )
+    except ClientError:  # pragma: no cover - not all S3 clones implement this
+        logger.warning("Could not set CORS policy on %s", bucket)
+
 
 def upload_file(bucket: str, path: str, data: bytes, content_type: str = "audio/wav") -> str:
     """Upload bytes to a bucket. Returns the storage key."""
