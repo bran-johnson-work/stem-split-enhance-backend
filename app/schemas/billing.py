@@ -26,7 +26,10 @@ class PlanResponse(BaseModel):
     display_name: str
     price_monthly_cents: int
     price_annual_cents: int
+    # Legacy project cap (no longer enforced; kept for display). None = unlimited.
     max_projects_per_month: int | None
+    # Audio files a user may upload per billing period. None = unlimited.
+    max_files_per_month: int | None = None
     max_file_size_mb: int
     features: dict | None
     is_active: bool

@@ -39,13 +39,19 @@ async def test_create_project_success(auth_client, monkeypatch, sample_user):
     assert resp.json()["id"] == str(project.id)
 
 
-async def test_create_project_quota_exceeded(auth_client, monkeypatch):
+async def test_upload_url_file_quota_exceeded(auth_client, monkeypatch):
+    # The metered unit is audio files: the monthly cap is enforced when a file's
+    # upload URL is requested (projects themselves are unlimited), surfacing 400.
+    project_id = uuid.uuid4()
     monkeypatch.setattr(
         projects_module.project_service,
-        "create_project",
-        AsyncMock(side_effect=ValueError("Monthly project limit reached (3).")),
+        "create_file_upload_url",
+        AsyncMock(side_effect=ValueError("Monthly upload limit reached (3 audio files).")),
     )
-    resp = await auth_client.post("/api/v1/projects", json={"name": "My song"})
+    resp = await auth_client.post(
+        f"/api/v1/projects/{project_id}/files/upload-url",
+        json={"filename": "song.wav", "content_type": "audio/wav"},
+    )
     assert resp.status_code == 400
     assert "limit reached" in resp.json()["detail"]
 

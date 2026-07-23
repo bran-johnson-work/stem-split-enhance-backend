@@ -28,8 +28,9 @@ async def create_project(
 ) -> Any:
     """Create an empty project, then upload file(s) into it via a presigned URL.
 
-    This consumes the plan's monthly project quota; the subsequent uploads to
-    ``/{project_id}/files/upload-url`` do not.
+    Projects are unlimited; the metered unit is audio files. The monthly file
+    quota is enforced when each file's upload URL is requested at
+    ``/{project_id}/files/upload-url``, not here.
     """
     project_name = (payload.name or "").strip() or "Untitled project"
     try:

@@ -117,18 +117,20 @@ class ProjectService:
             return get_settings().max_upload_size_bytes
         return plan.max_file_size_mb * 1024 * 1024
 
-    async def _enforce_project_quota(self, db: AsyncSession, user_id: uuid.UUID) -> None:
-        """Reject creation when the user is at their plan's monthly project cap.
+    async def _enforce_file_quota(self, db: AsyncSession, user_id: uuid.UUID) -> None:
+        """Reject a new upload when the user is at their plan's monthly file cap.
 
-        The window is the active subscription's billing period when present,
-        otherwise the current calendar month (UTC) against the ``free`` plan.
-        Plans with ``max_projects_per_month is None`` are unlimited. Counting is
-        an indexed ``COUNT`` on ``projects`` — cheap because it is bounded per
-        user; swap for a usage-ledger table if billing-period contention appears.
+        The metered unit is *audio files per month* (a project can hold many),
+        so the count is over ``project_files``, not projects. The window is the
+        active subscription's billing period when present, otherwise the current
+        calendar month (UTC) against the ``free`` plan. Plans with
+        ``max_files_per_month is None`` are unlimited. Called before minting each
+        presigned upload URL, so an over-quota file is blocked *before* any bytes
+        are uploaded. Raises ``ValueError`` when the cap is reached.
         """
         plan, window_start = await self._effective_plan_and_window(db, user_id)
 
-        limit = plan.max_projects_per_month if plan is not None else None
+        limit = plan.max_files_per_month if plan is not None else None
         if limit is None:
             # Unlimited plan, or the free plan is unseeded — don't hard-block uploads.
             if plan is None:
@@ -138,23 +140,22 @@ class ProjectService:
                 )
             return
 
-        used = await self.repository.count_for_user_since(db, user_id, window_start)
+        used = await self.file_repository.count_for_user_since(db, user_id, window_start)
         if used >= limit:
             raise ValueError(
-                f"Monthly project limit reached ({limit}). Upgrade your plan to create more."
+                f"Monthly upload limit reached ({limit} audio files). "
+                "Upgrade your plan to upload more."
             )
 
     async def create_project(
         self, db: AsyncSession, *, user_id: uuid.UUID, name: str
     ) -> Project:
-        """Create an empty project (no file yet), enforcing the monthly quota.
+        """Create an empty project (no file yet).
 
-        A project is the metered unit, so the quota check lives here — the
-        subsequent presigned upload(s) into this project are free. The project
+        Projects are unlimited — the metered unit is audio files, enforced when
+        each file is uploaded (see :meth:`_enforce_file_quota`). The project
         starts ``PENDING`` and moves to ``UPLOADING``/``QUEUED`` as files arrive.
-        Raises ``ValueError`` when the quota is exceeded.
         """
-        await self._enforce_project_quota(db, user_id)
         project = await self.repository.create(
             db,
             ProjectCreate(user_id=user_id, name=name, status=ProjectStatus.PENDING),
@@ -176,11 +177,13 @@ class ProjectService:
         """Mint a presigned URL to upload a file into an *existing* project.
 
         The project must already exist and belong to the user (create it first
-        via :meth:`create_project`); no quota is consumed here. Returns ``None``
-        when the project isn't found. Raises ``ValueError`` on an unsupported
-        content type, or :class:`FileTooLargeError` when a declared size exceeds
-        the plan limit. Delegates to :meth:`create_upload_url` with the project
-        pinned, keeping a single presign code path.
+        via :meth:`create_project`). Each file counts against the plan's monthly
+        file cap, enforced here before the URL is minted. Returns ``None`` when
+        the project isn't found. Raises ``ValueError`` on an unsupported content
+        type or when the monthly file quota is exceeded, or
+        :class:`FileTooLargeError` when a declared size exceeds the plan limit.
+        Delegates to :meth:`create_upload_url` with the project pinned, keeping a
+        single presign code path.
         """
         return await self.create_upload_url(
             db,
@@ -305,11 +308,15 @@ class ProjectService:
             project = await self.repository.get_for_user(db, project_id, user_id)
             if project is None:
                 return None
+            # Every file counts against the monthly cap, including ones added to
+            # an existing project — check before minting so the upload is blocked
+            # up front rather than after the bytes land.
+            await self._enforce_file_quota(db, user_id)
             project = await self.repository.update(
                 db, project, {"status": ProjectStatus.UPLOADING}
             )
         else:
-            await self._enforce_project_quota(db, user_id)
+            await self._enforce_file_quota(db, user_id)
             # Create the project first so the storage key can be namespaced by its id.
             project = await self.repository.create(
                 db,

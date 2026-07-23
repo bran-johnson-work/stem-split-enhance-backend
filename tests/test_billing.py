@@ -213,6 +213,7 @@ async def test_list_plans_is_public(client, monkeypatch):
     plan.price_monthly_cents = 1200
     plan.price_annual_cents = 12000
     plan.max_projects_per_month = 50
+    plan.max_files_per_month = 50
     plan.max_file_size_mb = 100
     plan.features = {"bullets": ["50 uploads / mo"]}
     plan.is_active = True
