@@ -32,10 +32,32 @@ class UserResponse(UserBase):
     is_active: bool
     is_verified: bool
     role: UserRole
+    # Short-lived signed URL to the user's avatar, or None. Computed per response
+    # from ``users.avatar_key`` — never read straight off the ORM object.
+    avatar_url: str | None = None
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AvatarUploadUrlRequest(BaseModel):
+    """Client asks for a presigned POST to upload a new avatar image."""
+
+    content_type: str = Field(min_length=1, max_length=255)
+
+
+class AvatarUploadUrlResponse(BaseModel):
+    """A presigned POST the client uploads the avatar image directly to S3 with.
+
+    Same contract as the audio upload: send ``multipart/form-data`` to ``url``
+    with every ``fields`` entry before the ``file`` part, then call
+    ``POST /users/me/avatar/complete``.
+    """
+
+    storage_key: str
+    url: str
+    fields: dict[str, str]
 
 
 class Token(BaseModel):

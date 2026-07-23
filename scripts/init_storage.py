@@ -34,10 +34,19 @@ def main() -> None:
     target = settings.aws_endpoint_url or f"AWS S3 ({settings.aws_region})"
     print(f"[info] provisioning buckets on {target}")
 
+    origins = settings.cors_origin_list
     try:
-        for bucket in (storage.BUCKET_INPUTS, storage.BUCKET_STEMS):
+        # De-duplicate: a deploy commonly points every S3_BUCKET_* at one bucket.
+        buckets = dict.fromkeys(
+            (storage.BUCKET_INPUTS, storage.BUCKET_STEMS, storage.BUCKET_AVATARS)
+        )
+        for bucket in buckets:
             storage.ensure_bucket(bucket, public=False)
             print(f"[ok] bucket ready: {bucket} (private)")
+        if origins:
+            print(f"[ok] bucket CORS set for origins: {', '.join(origins)}")
+        else:
+            print("[warn] CORS_ORIGINS is empty — real S3 will block browser uploads")
     except EndpointConnectionError as exc:
         raise SystemExit(
             f"[error] {_ENDPOINT_HINT.format(endpoint=settings.aws_endpoint_url)}"

@@ -28,6 +28,10 @@ _settings = get_settings()
 # unique across all AWS accounts, so a deploy usually needs a suffixed name.
 BUCKET_INPUTS = _settings.s3_bucket_inputs
 BUCKET_STEMS = _settings.s3_bucket_stems
+# Blank config reuses the inputs bucket (avatars are namespaced by an ``avatars/``
+# key prefix), so a deploy that points every S3_BUCKET_* at one bucket needs no
+# extra bucket or CORS setup for avatars.
+BUCKET_AVATARS = _settings.s3_bucket_avatars or _settings.s3_bucket_inputs
 
 
 @lru_cache

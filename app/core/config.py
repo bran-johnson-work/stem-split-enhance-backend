@@ -27,7 +27,20 @@ class Settings(BaseSettings):
     # S3 bucket names are globally unique across all AWS accounts — a real deploy suffixes these.
     s3_bucket_inputs: str = "audio-inputs"
     s3_bucket_stems: str = "audio-stems"
+    # Profile avatars. Kept private like the others; served via short-lived signed
+    # GET URLs surfaced on ``UserResponse.avatar_url``. Blank => reuse the inputs
+    # bucket (avatars live under an ``avatars/`` key prefix), so no separate bucket
+    # has to be created/CORS-configured — most deploys point every S3_BUCKET_* at
+    # one real bucket. Set this only to isolate avatars in their own bucket.
+    s3_bucket_avatars: str = ""
     s3_upload_url_expire_seconds: int = 3600
+    # Avatar download URL lifetime. Longer than an upload URL because it rides on
+    # the (cacheable) user object; 7 days is also the SigV4 presigned-URL maximum.
+    avatar_url_expire_seconds: int = 7 * 24 * 3600
+    # Per-avatar size ceiling, baked into the presign policy (mirrors the frontend
+    # AvatarStore's 2 MB limit).
+    max_avatar_size_bytes: int = 2 * 1024 * 1024
+    allowed_image_content_types: str = "image/png,image/jpeg,image/webp"
 
     # --- PostgreSQL (AWS RDS, or any standalone Postgres) ---
     # Set postgres_host to make these take precedence over the legacy DATABASE_URL(_POOLED).
@@ -152,6 +165,10 @@ class Settings(BaseSettings):
     @property
     def allowed_audio_content_type_set(self) -> set[str]:
         return {t.strip().lower() for t in self.allowed_audio_content_types.split(",") if t.strip()}
+
+    @property
+    def allowed_image_content_type_set(self) -> set[str]:
+        return {t.strip().lower() for t in self.allowed_image_content_types.split(",") if t.strip()}
 
     @property
     def has_postgres_components(self) -> bool:
