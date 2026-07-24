@@ -15,6 +15,7 @@ from app.schemas.project import (
     UploadUrlRequest,
     UploadUrlResponse,
 )
+from app.services.job_service import job_service
 from app.services.project_service import FileTooLargeError, project_service
 
 router = APIRouter()
@@ -138,6 +139,13 @@ async def complete_upload(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    # Auto-enqueue processing now the upload is confirmed in storage — otherwise the
+    # project sits in QUEUED forever with no ProcessingJob for the worker to claim.
+    # Idempotent: a second call while a job is in flight returns the existing job.
+    try:
+        await job_service.enqueue(db, project_id=project_id, user_id=current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return project
 
 
