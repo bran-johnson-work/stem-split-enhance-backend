@@ -32,12 +32,6 @@ WORKDIR /app
 # Copy the ready-built venv from the builder — the only heavy artifact we need.
 COPY --from=builder /opt/venv /opt/venv
 
-# API-only import closure (verified): main + api + the shared core/models/
-# repositories/schemas/services layers. The engine/worker packages (app/engine,
-# app/worker) carry the torch/demucs stack and are NOT imported by the API, so they
-# are intentionally excluded from this image. Add a package here if the API grows a
-# new import. Alembic is included so `alembic upgrade head` can be run as a one-off /
-# init job; migrations are intentionally NOT run at container start.
 COPY app/main.py ./app/main.py
 COPY app/api ./app/api
 COPY app/core ./app/core
