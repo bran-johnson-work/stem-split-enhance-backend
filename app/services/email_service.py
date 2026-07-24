@@ -19,25 +19,103 @@ from app.repositories.user_repository import user_repository
 logger = logging.getLogger(__name__)
 
 
-def _wrap(title: str, body_html: str) -> str:
-    """Wrap message content in a minimal, client-friendly HTML shell."""
+# --- Brand -----------------------------------------------------------------
+# KlearNote visual identity. Kept here (not in Settings) because it's design,
+# not configuration — every transactional email shares this look.
+_BRAND_NAME = "KlearNote"
+_BRAND_TAGLINE = "AI Audio Stem Separation"
+_BRAND_INK = "#0f172a"  # near-black headings
+_BRAND_BODY = "#475569"  # muted body text
+_BRAND_ACCENT = "#6366f1"  # indigo
+_BRAND_ACCENT_2 = "#8b5cf6"  # violet (gradient partner)
+_BRAND_PAGE_BG = "#eef0f6"  # page canvas behind the card
+_FONT_STACK = (
+    "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+)
+
+
+def _logo() -> str:
+    """Branded logo lockup: a gradient badge with a waveform glyph + wordmark.
+
+    Uses only inline styles + a Unicode glyph so it renders without external
+    images (which most clients block by default) or SVG (stripped by Gmail).
+    """
     return (
-        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;'
-        'margin:0 auto;color:#1a1a1a;line-height:1.5">'
-        f'<h2 style="margin:0 0 16px">{title}</h2>'
-        f"{body_html}"
-        '<p style="margin-top:32px;font-size:12px;color:#888">'
-        "AI Audio Stem Separation</p>"
-        "</div>"
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        'style="margin:0 auto"><tr>'
+        '<td style="vertical-align:middle;padding-right:10px">'
+        '<div style="width:40px;height:40px;border-radius:11px;'
+        f"background:{_BRAND_ACCENT};"
+        f"background-image:linear-gradient(135deg,{_BRAND_ACCENT} 0%,{_BRAND_ACCENT_2} 100%);"
+        'text-align:center;line-height:40px;font-size:20px;color:#ffffff">'
+        "&#127925;</div></td>"  # 🎵 musical note
+        '<td style="vertical-align:middle">'
+        f'<span style="font-family:{_FONT_STACK};font-size:20px;font-weight:700;'
+        f'color:{_BRAND_INK};letter-spacing:-0.02em">Klear'
+        f'<span style="color:{_BRAND_ACCENT}">Note</span></span></td>'
+        "</tr></table>"
+    )
+
+
+def _wrap(title: str, body_html: str, *, preheader: str = "") -> str:
+    """Wrap message content in the branded, client-friendly KlearNote shell.
+
+    A centered white card on a soft canvas, table-based with inline styles for
+    broad email-client support (Gmail, Outlook, Apple Mail). ``preheader`` is the
+    hidden inbox-preview snippet shown next to the subject line.
+    """
+    hidden_preheader = (
+        f'<div style="display:none;max-height:0;overflow:hidden;opacity:0;'
+        f'mso-hide:all">{preheader}</div>'
+        if preheader
+        else ""
+    )
+    return (
+        f'<div style="background:{_BRAND_PAGE_BG};margin:0;padding:32px 16px;'
+        f'font-family:{_FONT_STACK}">'
+        f"{hidden_preheader}"
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        'width="100%" style="max-width:520px;margin:0 auto">'
+        # Logo header
+        '<tr><td style="text-align:center;padding:4px 0 24px">'
+        f"{_logo()}</td></tr>"
+        # Card
+        '<tr><td style="background:#ffffff;border-radius:16px;'
+        'padding:40px 40px 36px;'
+        'box-shadow:0 1px 3px rgba(15,23,42,0.06),0 8px 24px rgba(15,23,42,0.05)">'
+        # Accent pill
+        f'<div style="width:44px;height:4px;border-radius:2px;'
+        f"background:{_BRAND_ACCENT};"
+        f"background-image:linear-gradient(90deg,{_BRAND_ACCENT},{_BRAND_ACCENT_2});"
+        'margin:0 0 24px"></div>'
+        f'<h1 style="margin:0 0 16px;font-size:24px;line-height:1.3;'
+        f'font-weight:700;color:{_BRAND_INK};letter-spacing:-0.02em">{title}</h1>'
+        f'<div style="font-size:15px;line-height:1.65;color:{_BRAND_BODY}">'
+        f"{body_html}</div>"
+        "</td></tr>"
+        # Footer
+        '<tr><td style="text-align:center;padding:24px 16px 4px;'
+        f'font-size:12px;line-height:1.6;color:#94a3b8">'
+        f"<p style=\"margin:0 0 4px;font-weight:600;color:#64748b\">{_BRAND_NAME}</p>"
+        f'<p style="margin:0">{_BRAND_TAGLINE}</p>'
+        f'<p style="margin:8px 0 0">You received this email because an account '
+        f"was created with this address.</p>"
+        "</td></tr>"
+        "</table></div>"
     )
 
 
 def _button(url: str, label: str) -> str:
+    """A prominent, gradient call-to-action button (solid-color fallback for Outlook)."""
     return (
-        f'<p><a href="{url}" '
-        'style="display:inline-block;background:#4f46e5;color:#fff;'
-        'text-decoration:none;padding:12px 20px;border-radius:8px">'
-        f"{label}</a></p>"
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        'style="margin:28px 0"><tr><td style="border-radius:10px;'
+        f"background:{_BRAND_ACCENT};"
+        f'background-image:linear-gradient(135deg,{_BRAND_ACCENT} 0%,{_BRAND_ACCENT_2} 100%)">'
+        f'<a href="{url}" style="display:inline-block;padding:14px 32px;'
+        'font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;'
+        'border-radius:10px">'
+        f"{label}</a></td></tr></table>"
     )
 
 
@@ -66,24 +144,39 @@ class EmailService:
 
         if get_settings().is_local:
             logger.info("Local email-verification link for %s: %s", user.email, link)
-        greeting = f"Hi {user.full_name}," if user.full_name else "Hi,"
+        greeting = f"Hi {user.full_name}," if user.full_name else "Hey there,"
         html = _wrap(
             "Confirm your email",
-            f"<p>{greeting}</p>"
-            "<p>Thanks for signing up. Please confirm your email address to "
-            "activate all features of your account.</p>"
-            f"{_button(link, 'Verify email')}"
-            "<p style=\"font-size:13px;color:#555\">Or paste this link into your "
-            f'browser:<br><a href="{link}">{link}</a></p>'
-            "<p style=\"font-size:13px;color:#555\">If you didn't create this "
-            "account, you can safely ignore this email.</p>",
+            f'<p style="margin:0 0 16px">{greeting}</p>'
+            '<p style="margin:0 0 16px">Welcome to KlearNote &#127911; — where your '
+            "tracks get split into clean, studio-ready stems. You're one click away "
+            "from getting started.</p>"
+            '<p style="margin:0 0 8px">Tap the button below to confirm your email '
+            "and unlock your account:</p>"
+            f"{_button(link, 'Confirm my email')}"
+            '<p style="margin:0 0 8px;font-size:13px;color:#94a3b8">'
+            "Button not working? Paste this link into your browser:</p>"
+            f'<p style="margin:0 0 24px;font-size:13px;word-break:break-all">'
+            f'<a href="{link}" style="color:{_BRAND_ACCENT};text-decoration:none">'
+            f"{link}</a></p>"
+            f'<div style="border-top:1px solid #eef0f6;margin:24px 0 0;padding-top:16px">'
+            '<p style="margin:0;font-size:13px;color:#94a3b8">This link expires in '
+            "24 hours. If you didn't create a KlearNote account, you can safely "
+            "ignore this email.</p></div>",
+            preheader="Confirm your email to activate your KlearNote account.",
         )
         try:
             return await send_email(
                 to=user.email,
-                subject="Verify your email address",
+                subject="Confirm your email · KlearNote",
                 html=html,
-                text=f"{greeting}\nVerify your email address: {link}",
+                text=(
+                    f"{greeting}\n\n"
+                    "Welcome to KlearNote! Confirm your email to activate your "
+                    f"account:\n{link}\n\n"
+                    "This link expires in 24 hours. If you didn't create a "
+                    "KlearNote account, you can ignore this email."
+                ),
             )
         except Exception:  # pragma: no cover - defensive; send_email logs details
             logger.exception("Failed to send verification email to %s", user.email)

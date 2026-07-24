@@ -1,56 +1,67 @@
-"""Provision the Supabase Storage buckets this API depends on.
+"""Provision the S3 buckets this API depends on.
 
-Idempotent: creates the ``audio-inputs`` and ``audio-stems`` buckets if they
-are missing, otherwise updates them to match the configured limits. Both are
-kept **private** — downloads go through short-lived signed URLs.
+Idempotent: creates the input and stem buckets if they are missing. Both are kept
+**private** (public access blocked) — downloads go through short-lived signed URLs.
 
-Run after setting SUPABASE_SERVICE_ROLE_KEY in .env:
+Unlike Supabase Storage, an S3 bucket carries no ``file_size_limit`` or
+``allowed_mime_types``; those are enforced per-upload by the presigned POST policy
+minted in ``app.core.storage.create_signed_upload_url``, so there is nothing to
+configure on the bucket here.
+
+Run after setting the AWS_* variables in .env:
 
     python -m scripts.init_storage
+
+Against LocalStack (AWS_ENDPOINT_URL=http://localhost:4566) this needs the
+container running; against real AWS it needs credentials with s3:CreateBucket.
 """
 
-from storage3.exceptions import StorageApiError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from app.core import storage
 from app.core.config import get_settings
 
-# Printed when Supabase refuses the requested bucket file_size_limit because it
-# exceeds the project-wide global upload cap (Free plan is capped at 50 MB).
-_SIZE_CAP_HINT = (
-    "Supabase rejected a {mb} MB bucket limit: it exceeds this project's GLOBAL "
-    "storage upload limit.\n"
-    "  Fix (to support paid tiers): Dashboard -> Storage -> Settings -> 'Upload "
-    "file size limit' and raise it. The Free plan is capped at 50 MB; a larger "
-    "limit needs a paid Supabase plan. Then re-run this script.\n"
-    "  Or (to unblock now): set MAX_UPLOAD_SIZE_BYTES in .env to a value within "
-    "the current cap (e.g. 52428800 for 50 MB)."
+_ENDPOINT_HINT = (
+    "Could not reach the S3 endpoint at {endpoint}.\n"
+    "  If you're using LocalStack, start it first:\n"
+    "    docker run --rm -p 4566:4566 localstack/localstack\n"
+    "  If you meant to use real AWS, leave AWS_ENDPOINT_URL empty in .env."
 )
 
 
 def main() -> None:
     settings = get_settings()
-    mb = settings.max_upload_size_bytes // (1024 * 1024)
+    target = settings.aws_endpoint_url or f"AWS S3 ({settings.aws_region})"
+    print(f"[info] provisioning buckets on {target}")
 
-    # Original uploads: private, size-capped, restricted to audio MIME types.
+    origins = settings.cors_origin_list
     try:
-        storage.ensure_bucket(
-            storage.BUCKET_INPUTS,
-            public=False,
-            file_size_limit=settings.max_upload_size_bytes,
-            allowed_mime_types=sorted(settings.allowed_audio_content_type_set),
+        # De-duplicate: a deploy commonly points every S3_BUCKET_* at one bucket.
+        buckets = dict.fromkeys(
+            (storage.BUCKET_INPUTS, storage.BUCKET_STEMS, storage.BUCKET_AVATARS)
         )
-    except StorageApiError as exc:
-        if getattr(exc, "status", None) == 413 or "maximum allowed size" in str(
-            getattr(exc, "message", exc)
-        ).lower():
-            raise SystemExit(f"[error] {_SIZE_CAP_HINT.format(mb=mb)}") from exc
+        for bucket in buckets:
+            storage.ensure_bucket(bucket, public=False)
+            print(f"[ok] bucket ready: {bucket} (private)")
+        if origins:
+            print(f"[ok] bucket CORS set for origins: {', '.join(origins)}")
+        else:
+            print("[warn] CORS_ORIGINS is empty — real S3 will block browser uploads")
+    except EndpointConnectionError as exc:
+        raise SystemExit(
+            f"[error] {_ENDPOINT_HINT.format(endpoint=settings.aws_endpoint_url)}"
+        ) from exc
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code in ("InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied"):
+            raise SystemExit(
+                f"[error] S3 rejected the credentials ({code}). Check AWS_ACCESS_KEY_ID / "
+                "AWS_SECRET_ACCESS_KEY in .env — LocalStack accepts any non-empty pair."
+            ) from exc
         raise
-    print(f"[ok] bucket ready: {storage.BUCKET_INPUTS} (limit {mb} MB)")
 
-    # Engine-produced stems: private. The engine controls format/size, so no
-    # MIME restriction; still served via signed URLs only.
-    storage.ensure_bucket(storage.BUCKET_STEMS, public=False)
-    print(f"[ok] bucket ready: {storage.BUCKET_STEMS}")
+    mb = settings.max_upload_size_bytes // (1024 * 1024)
+    print(f"[info] uploads are capped at {mb} MB by the presign policy, not the bucket")
 
 
 if __name__ == "__main__":

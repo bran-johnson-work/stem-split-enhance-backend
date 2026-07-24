@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -137,3 +138,28 @@ def decode_email_verification_token(token: str) -> dict[str, Any]:
     if payload.get("purpose") != EMAIL_VERIFICATION_PURPOSE:
         raise jwt.InvalidTokenError("Token is not an email-verification token")
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Refresh tokens.
+#
+# Opaque random strings, not JWTs. A refresh token must be revocable — that is
+# the whole reason it exists — and a self-contained JWT cannot be revoked
+# without a denylist lookup anyway, so the DB row is made the authority instead.
+#
+# Only the hash is persisted (see RefreshToken.token_hash). SHA-256 with no salt
+# is correct here, unlike for passwords: the input is 256 bits of CSPRNG output,
+# so there is no dictionary to attack and nothing for a salt to defend against.
+# ---------------------------------------------------------------------------
+
+_REFRESH_TOKEN_BYTES = 32
+
+
+def create_refresh_token() -> str:
+    """Mint a new opaque refresh token. Returned once, to the client only."""
+    return secrets.token_urlsafe(_REFRESH_TOKEN_BYTES)
+
+
+def hash_refresh_token(token: str) -> str:
+    """The stored form of a refresh token: SHA-256 hex."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

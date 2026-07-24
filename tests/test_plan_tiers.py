@@ -10,8 +10,11 @@ Two things are verified here:
    ships.
 2. **Per-tier enforcement** — the app hard-enforces two plan limits, tested per
    tier here:
-   - ``max_projects_per_month`` (``ProjectService._enforce_project_quota``): free
-     blocks the 4th project, creator the 51st, pro/studio (unlimited) never block.
+   - ``max_files_per_month`` (``ProjectService._enforce_file_quota``): the metered
+     unit is audio files, so free blocks the 4th file, creator the 51st,
+     pro/studio (unlimited) never block. (``max_projects_per_month`` is retained
+     in the catalogue for display but is no longer enforced — projects are
+     unlimited.)
    - ``max_file_size_mb`` (``ProjectService._enforce_file_size``): each tier
      accepts a file at its limit and rejects one a byte over.
 
@@ -55,6 +58,26 @@ def _load_seed_plans() -> dict[str, dict]:
 
 
 SEED = _load_seed_plans()
+
+
+def _load_file_caps() -> dict[str, int | None]:
+    """The per-tier monthly audio-file caps, straight from the migration that seeds them."""
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "alembic"
+        / "versions"
+        / "d4a7c9e1b3f0_add_max_files_per_month_to_plans.py"
+    )
+    spec = importlib.util.spec_from_file_location("add_max_files_per_month", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return dict(module.FILE_CAPS)
+
+
+FILE_CAPS = _load_file_caps()
+
+# The agreed monthly file allowance per tier (the metered unit). ``None`` = unlimited.
+EXPECTED_FILE_CAPS = {"free": 3, "creator": 50, "pro": None, "studio": None}
 
 # The agreed pricing table (your screenshot). This is the source of truth the
 # seed must satisfy — prices in cents, ``None`` = unlimited.
@@ -169,14 +192,19 @@ def test_feature_flags_form_a_capability_ladder():
     assert len(set(serialized)) == 4
 
 
-# --- Per-tier quota enforcement (the one real behavioural difference) -------
+# --- Per-tier file-quota enforcement (the one real behavioural difference) --
+
+
+def test_seeded_file_caps_match_the_agreed_table():
+    """The migration's per-tier file caps equal the agreed allowance."""
+    assert FILE_CAPS == EXPECTED_FILE_CAPS
 
 
 def _quota_service(monkeypatch, *, subscription, plan, used):
-    """A service running the real quota method with mocked plan/subscription repos."""
+    """A service running the real file-quota method with mocked plan/subscription repos."""
     svc = ProjectService()
-    svc.repository = AsyncMock()
-    svc.repository.count_for_user_since.return_value = used
+    svc.file_repository = AsyncMock()
+    svc.file_repository.count_for_user_since.return_value = used
 
     sub_repo = AsyncMock()
     sub_repo.get_for_user.return_value = subscription
@@ -187,37 +215,36 @@ def _quota_service(monkeypatch, *, subscription, plan, used):
     return svc
 
 
-def _active_subscription(max_projects):
+def _active_subscription(max_files):
     return SimpleNamespace(
         status=SubscriptionStatus.ACTIVE,
         current_period_start=datetime.now(timezone.utc),
-        plan=SimpleNamespace(max_projects_per_month=max_projects),
+        plan=SimpleNamespace(max_files_per_month=max_files),
     )
 
 
 # Tiers whose cap is a finite number the app enforces.
-FINITE_TIERS = [(n, EXPECTED[n]["max_projects_per_month"]) for n in TIER_ORDER
-                if EXPECTED[n]["max_projects_per_month"] is not None]
-UNLIMITED_TIERS = [n for n in TIER_ORDER if EXPECTED[n]["max_projects_per_month"] is None]
+FINITE_TIERS = [(n, FILE_CAPS[n]) for n in TIER_ORDER if FILE_CAPS[n] is not None]
+UNLIMITED_TIERS = [n for n in TIER_ORDER if FILE_CAPS[n] is None]
 
 
 @pytest.mark.parametrize("name,limit", FINITE_TIERS)
-async def test_tier_blocks_at_its_project_limit(name, limit, fake_db, monkeypatch):
-    """A finite tier rejects the (limit+1)-th project in the current window."""
+async def test_tier_blocks_at_its_file_limit(name, limit, fake_db, monkeypatch):
+    """A finite tier rejects the (limit+1)-th audio file in the current window."""
     if name == "free":
         # Free tier has no subscription: enforcement falls back to the free plan.
         svc = _quota_service(
             monkeypatch,
             subscription=None,
-            plan=SimpleNamespace(max_projects_per_month=limit),
+            plan=SimpleNamespace(max_files_per_month=limit),
             used=limit,
         )
     else:
         svc = _quota_service(
             monkeypatch, subscription=_active_subscription(limit), plan=None, used=limit
         )
-    with pytest.raises(ValueError, match=rf"reached \({limit}\)"):
-        await svc._enforce_project_quota(fake_db, uuid.uuid4())
+    with pytest.raises(ValueError, match=rf"reached \({limit} audio files\)"):
+        await svc._enforce_file_quota(fake_db, uuid.uuid4())
 
 
 @pytest.mark.parametrize("name,limit", FINITE_TIERS)
@@ -226,14 +253,14 @@ async def test_tier_allows_just_under_its_limit(name, limit, fake_db, monkeypatc
         svc = _quota_service(
             monkeypatch,
             subscription=None,
-            plan=SimpleNamespace(max_projects_per_month=limit),
+            plan=SimpleNamespace(max_files_per_month=limit),
             used=limit - 1,
         )
     else:
         svc = _quota_service(
             monkeypatch, subscription=_active_subscription(limit), plan=None, used=limit - 1
         )
-    await svc._enforce_project_quota(fake_db, uuid.uuid4())  # no raise
+    await svc._enforce_file_quota(fake_db, uuid.uuid4())  # no raise
 
 
 @pytest.mark.parametrize("name", UNLIMITED_TIERS)
@@ -242,8 +269,8 @@ async def test_unlimited_tier_never_blocks(name, fake_db, monkeypatch):
     svc = _quota_service(
         monkeypatch, subscription=_active_subscription(None), plan=None, used=10_000
     )
-    await svc._enforce_project_quota(fake_db, uuid.uuid4())  # no raise
-    svc.repository.count_for_user_since.assert_not_called()
+    await svc._enforce_file_quota(fake_db, uuid.uuid4())  # no raise
+    svc.file_repository.count_for_user_since.assert_not_called()
 
 
 # --- Per-tier file-size enforcement ----------------------------------------

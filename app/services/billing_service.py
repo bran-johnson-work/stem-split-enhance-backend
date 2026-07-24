@@ -23,6 +23,7 @@ from app.repositories.plan_repository import plan_repository
 from app.repositories.subscription_repository import subscription_repository
 from app.schemas.billing import (
     BillingEventCreate,
+    InvoiceResponse,
     PlanResponse,
     SubscriptionCreate,
     SubscriptionResponse,
@@ -75,6 +76,62 @@ def _first_price_id(subscription_obj: dict[str, Any]) -> str | None:
         return subscription_obj["items"]["data"][0]["price"]["id"]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+# Stripe invoice.status -> the three states the UI renders. Anything unpayable
+# (voided, written off) reads as a failed charge; a draft hasn't been issued yet
+# but is filtered out before this map is reached.
+_INVOICE_STATUS_MAP = {
+    "paid": "paid",
+    "open": "open",
+    "draft": "open",
+    "uncollectible": "failed",
+    "void": "failed",
+}
+
+
+def _map_invoice_status(stripe_status: str | None) -> str:
+    return _INVOICE_STATUS_MAP.get(stripe_status or "", "open")
+
+
+def _invoice_description(inv: dict[str, Any]) -> str | None:
+    """A human label for the invoice.
+
+    Stripe rarely fills the top-level ``description`` on a subscription invoice,
+    so fall back to the first line item's — which reads like "Pro — monthly" when
+    the price carries a nickname. Never fabricated: the client shows
+    "Subscription" when this is null.
+    """
+    if inv.get("description"):
+        return inv["description"]
+    lines = (inv.get("lines") or {}).get("data") or []
+    if lines and lines[0].get("description"):
+        return lines[0]["description"]
+    return None
+
+
+def _is_listable_invoice(inv: dict[str, Any]) -> bool:
+    """Hide drafts — they aren't finalised, carry no stable amount, and would
+    confuse a receipts list."""
+    return inv.get("status") != "draft"
+
+
+def _map_invoice(inv: dict[str, Any]) -> "InvoiceResponse":
+    # Stripe amounts are in the currency's minor unit (cents); the API speaks
+    # dollars, matching how plan prices are surfaced. ``total`` is the invoice's
+    # definitive amount (``amount_paid`` is 0 on an unpaid one).
+    total_cents = inv.get("total")
+    amount = (total_cents or 0) / 100
+    return InvoiceResponse(
+        id=str(inv["id"]),
+        created_at=datetime.fromtimestamp(int(inv.get("created", 0)), tz=timezone.utc),
+        amount=amount,
+        currency=str(inv.get("currency", "usd")).upper(),
+        status=_map_invoice_status(inv.get("status")),
+        description=_invoice_description(inv),
+        hosted_invoice_url=inv.get("hosted_invoice_url"),
+        invoice_pdf=inv.get("invoice_pdf"),
+    )
 
 
 def _extract_user_id(obj: dict[str, Any]) -> uuid.UUID | None:
@@ -134,6 +191,28 @@ class BillingService:
             cancel_at_period_end=False,
             cancelled_at=None,
         )
+
+    async def list_invoices(
+        self, db: AsyncSession, user_id: uuid.UUID
+    ) -> list[InvoiceResponse]:
+        """The caller's invoices, read live from Stripe (newest first).
+
+        Returns ``[]`` rather than erroring for anyone without a billing account
+        — a free user, or one who never completed checkout, simply has no
+        receipts. Only a genuine Stripe transport failure propagates.
+        """
+        settings = get_settings()
+        if not settings.billing_enabled:
+            return []
+
+        subscription = await subscription_repository.get_for_user(db, user_id)
+        if subscription is None or not subscription.stripe_customer_id:
+            return []
+
+        raw_invoices = await stripe.list_invoices(
+            customer_id=subscription.stripe_customer_id
+        )
+        return [_map_invoice(inv) for inv in raw_invoices if _is_listable_invoice(inv)]
 
     # --- Checkout / Portal ------------------------------------------------
 

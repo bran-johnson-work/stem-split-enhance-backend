@@ -21,7 +21,7 @@ async def test_send_verification_email_composes_and_sends(monkeypatch, sample_us
     send.assert_awaited_once()
     kwargs = send.call_args.kwargs
     assert kwargs["to"] == sample_user.email
-    assert "verify" in kwargs["subject"].lower()
+    assert "email" in kwargs["subject"].lower()
     # The verification link (frontend URL + token) must be embedded in the body.
     assert "verify-email?token=" in kwargs["html"]
 

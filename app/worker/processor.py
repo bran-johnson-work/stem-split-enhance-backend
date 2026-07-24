@@ -198,7 +198,7 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
             await asyncio.sleep(settings.worker_progress_poll_seconds)
         finalized, _sr = await task
 
-        # 4. Persist each stem (Supabase bucket, or a local folder if configured) and record it.
+        # 4. Persist each stem (S3 bucket, or a local folder if configured) and record it.
         prefix = f"{project.user_id}/{project.id}/stems"
         for idx, stem in enumerate(finalized):
             await _emit_progress(
@@ -240,9 +240,9 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
 def _persist_stem(settings: Settings, storage_key: str, stem: FinalizedStem) -> None:
     """Write one finalized stem to its destination (runs off the event loop).
 
-    Uploads to the Supabase stems bucket by default. When ``stems_local_dir`` is
+    Uploads to the S3 stems bucket by default. When ``stems_local_dir`` is
     configured, copies the file to ``<stems_local_dir>/<storage_key>`` on local
-    disk instead — sidestepping Supabase's 50 MB object cap on the Free plan.
+    disk instead, keeping stems off object storage entirely.
     """
     if settings.stems_local_dir:
         dest = Path(settings.stems_local_dir) / storage_key

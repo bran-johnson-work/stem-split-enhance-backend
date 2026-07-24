@@ -42,18 +42,53 @@ _models: dict[str, tuple[object, str]] = {}
 _load_lock = threading.Lock()
 
 
-def _pick_device() -> str:
-    """Best available compute: CUDA GPU, else Apple Silicon (MPS), else CPU.
+def _mps_available() -> bool:
+    """True on Apple Silicon with a working MPS backend; False everywhere else.
 
-    The MPS check is guarded so it cannot raise on platforms without it (it returns
-    False off Apple hardware). CPU works everywhere; it is just slower.
+    Guarded so it can't raise on platforms where torch has no ``mps`` backend.
     """
-    if torch.cuda.is_available():
-        return "cuda"
     mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
+    return bool(mps is not None and mps.is_available())
+
+
+def _pick_device() -> str:
+    """Resolve the compute device from ``settings.worker_device``.
+
+    - ``auto`` (default): best available — CUDA GPU > Apple MPS > CPU.
+    - ``cuda`` / ``cuda:N``: *require* that GPU. If CUDA isn't visible we raise
+      rather than silently fall back to CPU — on a rented AWS GPU box a silent CPU
+      fallback would run 10-50x slower with no signal, wasting the instance.
+    - ``mps``: require Apple MPS (raises if unavailable).
+    - ``cpu``: force CPU (works everywhere, just slower).
+    """
+    configured = (get_settings().worker_device or "auto").strip().lower()
+
+    if configured in ("", "auto"):
+        if torch.cuda.is_available():
+            return "cuda"
+        return "mps" if _mps_available() else "cpu"
+
+    if configured.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"WORKER_DEVICE={configured!r} requires CUDA, but torch.cuda.is_available() "
+                "is False. On an AWS GPU host check: this is a GPU instance, the NVIDIA "
+                "driver + nvidia-container-toolkit are installed, the container was started "
+                "with `--gpus all`, and torch is a CUDA build (GPU wheels, not the cpu index)."
+            )
+        return configured
+
+    if configured == "mps":
+        if not _mps_available():
+            raise RuntimeError("WORKER_DEVICE='mps' requested but the MPS backend is unavailable.")
         return "mps"
-    return "cpu"
+
+    if configured == "cpu":
+        return "cpu"
+
+    raise RuntimeError(
+        f"Unrecognized WORKER_DEVICE={configured!r}; use one of: auto | cpu | cuda | cuda:N | mps."
+    )
 
 
 def weights_cached() -> bool:
@@ -96,6 +131,13 @@ def get_model_and_device(name: str | None = None):
         if cached is not None:  # another thread finished while we waited
             return cached
         device = _pick_device()
+        if device.startswith("cuda"):
+            # Fixed-size chunks from apply_model -> cuDNN autotuner pays off after warmup.
+            torch.backends.cudnn.benchmark = True
+            try:
+                logger.info("model.device.cuda name=%s", torch.cuda.get_device_name(0))
+            except Exception:  # pragma: no cover - purely informational
+                pass
         logger.info("model.loading name=%s device=%s (first run downloads weights)", name, device)
         model = get_model(name)
         model.to(device)

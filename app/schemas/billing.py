@@ -26,7 +26,10 @@ class PlanResponse(BaseModel):
     display_name: str
     price_monthly_cents: int
     price_annual_cents: int
+    # Legacy project cap (no longer enforced; kept for display). None = unlimited.
     max_projects_per_month: int | None
+    # Audio files a user may upload per billing period. None = unlimited.
+    max_files_per_month: int | None = None
     max_file_size_mb: int
     features: dict | None
     is_active: bool
@@ -79,6 +82,27 @@ class CancelRequest(BaseModel):
     """Cancel the caller's subscription. Defaults to end-of-period (keep access)."""
 
     immediate: bool = False
+
+
+class InvoiceResponse(BaseModel):
+    """One billing receipt, sourced live from Stripe.
+
+    Amounts are **dollars** (Stripe reports cents; the service converts) so the
+    client formats them the same as every other price. The two URLs are Stripe's
+    own: ``hosted_invoice_url`` is a full receipt page, ``invoice_pdf`` a direct
+    PDF download — both short-lived, so they are fetched on demand, never stored.
+    """
+
+    id: str
+    # When the invoice was finalised, ISO-8601.
+    created_at: datetime
+    amount: float
+    currency: str
+    # Normalised to the set the UI renders: paid | open | failed.
+    status: str
+    description: str | None
+    hosted_invoice_url: str | None
+    invoice_pdf: str | None
 
 
 # --- Internal persistence schemas (feed BaseRepository create/update) ------

@@ -80,11 +80,14 @@ async def _request(method: str, path: str, data: dict[str, Any] | None = None) -
         "Authorization": f"Bearer {settings.stripe_secret_key}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
+    # Stripe reads list/read filters from the query string on GET, and form body
+    # on write verbs. Flattened either way (Stripe uses the same bracketed form
+    # for nested query params, e.g. ``created[gte]``).
+    flat = _flatten(data or {})
+    request_kwargs: dict[str, Any] = {"params": flat} if method == "GET" else {"data": flat}
     try:
         async with httpx.AsyncClient(timeout=settings.stripe_timeout_seconds) as client:
-            response = await client.request(
-                method, url, data=_flatten(data or {}), headers=headers
-            )
+            response = await client.request(method, url, headers=headers, **request_kwargs)
     except httpx.HTTPError as exc:  # transport error (DNS, timeout, connection)
         logger.error("Stripe transport error on %s: %s", path, exc)
         raise StripeError(f"Stripe transport error: {exc}") from exc
@@ -98,6 +101,10 @@ async def _request(method: str, path: str, data: dict[str, Any] | None = None) -
 
 async def _post(path: str, data: dict[str, Any]) -> dict[str, Any]:
     return await _request("POST", path, data)
+
+
+async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return await _request("GET", path, params)
 
 
 async def create_customer(*, email: str, user_id: str) -> dict[str, Any]:
@@ -185,6 +192,18 @@ async def resume_subscription(*, subscription_id: str) -> dict[str, Any]:
 async def cancel_subscription_now(*, subscription_id: str) -> dict[str, Any]:
     """Cancel a subscription immediately (DELETE); access ends at once."""
     return await _request("DELETE", f"subscriptions/{subscription_id}")
+
+
+async def list_invoices(*, customer_id: str, limit: int = 24) -> list[dict[str, Any]]:
+    """List a customer's invoices, newest first (Stripe's default order).
+
+    Stripe is the system of record for invoices — it renders and hosts the PDF —
+    so the app reads them on demand rather than keeping its own copies. Returns
+    the raw ``data`` array; ``billing_service`` maps it to the API DTO.
+    """
+    response = await _get("invoices", {"customer": customer_id, "limit": limit})
+    data = response.get("data")
+    return data if isinstance(data, list) else []
 
 
 def construct_event(

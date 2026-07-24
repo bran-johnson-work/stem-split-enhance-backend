@@ -213,6 +213,7 @@ async def test_list_plans_is_public(client, monkeypatch):
     plan.price_monthly_cents = 1200
     plan.price_annual_cents = 12000
     plan.max_projects_per_month = 50
+    plan.max_files_per_month = 50
     plan.max_file_size_mb = 100
     plan.features = {"bullets": ["50 uploads / mo"]}
     plan.is_active = True
@@ -419,3 +420,117 @@ async def test_webhook_disabled_returns_404(client):
         "/api/v1/billing/webhook", content=b"{}", headers={"stripe-signature": "x"}
     )
     assert resp.status_code == 404
+
+
+# ---- invoices (unit: mapping) ---------------------------------------------
+
+
+def _stripe_invoice(**overrides) -> dict:
+    """A minimal Stripe invoice object, shaped like the real API response."""
+    inv = {
+        "id": "in_test_123",
+        "created": 1_752_000_000,
+        "total": 7900,
+        "currency": "usd",
+        "status": "paid",
+        "description": None,
+        "hosted_invoice_url": "https://invoice.stripe.com/i/acct_1/test",
+        "invoice_pdf": "https://invoice.stripe.com/i/acct_1/test.pdf",
+        "lines": {"data": [{"description": "Pro — monthly"}]},
+    }
+    inv.update(overrides)
+    return inv
+
+
+def test_map_invoice_converts_cents_to_dollars_and_status():
+    result = bsvc._map_invoice(_stripe_invoice())
+    assert result.amount == 79.0  # 7900 cents
+    assert result.currency == "USD"
+    assert result.status == "paid"
+    assert result.invoice_pdf.endswith(".pdf")
+
+
+def test_map_invoice_falls_back_to_line_item_description():
+    result = bsvc._map_invoice(_stripe_invoice(description=None))
+    assert result.description == "Pro — monthly"
+
+
+def test_map_invoice_prefers_top_level_description():
+    result = bsvc._map_invoice(_stripe_invoice(description="Manual charge"))
+    assert result.description == "Manual charge"
+
+
+def test_map_invoice_status_normalises_unpayable_to_failed():
+    assert bsvc._map_invoice(_stripe_invoice(status="void")).status == "failed"
+    assert bsvc._map_invoice(_stripe_invoice(status="uncollectible")).status == "failed"
+    assert bsvc._map_invoice(_stripe_invoice(status="open")).status == "open"
+
+
+def test_draft_invoices_are_hidden():
+    assert bsvc._is_listable_invoice(_stripe_invoice(status="draft")) is False
+    assert bsvc._is_listable_invoice(_stripe_invoice(status="paid")) is True
+
+
+# ---- invoices (service + endpoint) ----------------------------------------
+
+
+async def test_list_invoices_empty_without_billing(auth_client, monkeypatch):
+    """Free users / billing disabled → an empty list, not an error."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_secret_key", "")
+    resp = await auth_client.get("/api/v1/billing/invoices")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_list_invoices_empty_without_customer(auth_client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_secret_key", "sk_test")
+    monkeypatch.setattr(
+        bsvc.subscription_repository, "get_for_user", AsyncMock(return_value=None)
+    )
+    resp = await auth_client.get("/api/v1/billing/invoices")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_list_invoices_returns_mapped_stripe_data(auth_client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_secret_key", "sk_test")
+
+    sub = MagicMock()
+    sub.stripe_customer_id = "cus_test_1"
+    monkeypatch.setattr(
+        bsvc.subscription_repository, "get_for_user", AsyncMock(return_value=sub)
+    )
+    monkeypatch.setattr(
+        bsvc.stripe,
+        "list_invoices",
+        AsyncMock(return_value=[_stripe_invoice(), _stripe_invoice(status="draft")]),
+    )
+
+    resp = await auth_client.get("/api/v1/billing/invoices")
+    assert resp.status_code == 200
+    body = resp.json()
+    # The draft is filtered out; the paid one is mapped.
+    assert len(body) == 1
+    assert body[0]["amount"] == 79.0
+    assert body[0]["status"] == "paid"
+    assert body[0]["hosted_invoice_url"].startswith("https://invoice.stripe.com/")
+
+
+async def test_list_invoices_maps_stripe_outage_to_502(auth_client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_secret_key", "sk_test")
+    sub = MagicMock()
+    sub.stripe_customer_id = "cus_test_1"
+    monkeypatch.setattr(
+        bsvc.subscription_repository, "get_for_user", AsyncMock(return_value=sub)
+    )
+    monkeypatch.setattr(
+        bsvc.stripe,
+        "list_invoices",
+        AsyncMock(side_effect=stripe_mod.StripeError("boom")),
+    )
+    resp = await auth_client.get("/api/v1/billing/invoices")
+    assert resp.status_code == 502

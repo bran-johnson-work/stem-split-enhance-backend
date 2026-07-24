@@ -3,7 +3,7 @@ from logging.config import fileConfig
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 
 import app.models as models  # noqa: F401 — ensure all models are registered on Base.metadata
 from alembic import context
@@ -16,9 +16,10 @@ settings = get_settings()
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Use direct connection when available; fall back to pooled if direct DNS fails.
-# Pooled URL requires prepared_statement_cache_size=0 for Alembic DDL compatibility.
-_db_url = settings.database_url or settings.database_url_pooled
+# Discrete POSTGRES_* components (AWS RDS) take precedence; otherwise fall back to
+# the legacy Supabase direct connection. The pooler URL requires
+# prepared_statement_cache_size=0 for Alembic DDL compatibility.
+_db_url = settings.migration_database_url
 if "pooler.supabase.com" in _db_url and "prepared_statement_cache_size" not in _db_url:
     _db_url += "?prepared_statement_cache_size=0"
 config.set_main_option("sqlalchemy.url", _db_url)
@@ -45,10 +46,14 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    # NullPool: migrations are a short-lived one-shot connection. connect_args carries
+    # TLS (postgres_ssl) for RDS; the pooler prepared-statement tweak is already baked
+    # into the URL query above for the legacy path.
+    connect_args = {"ssl": True} if settings.postgres_ssl else {}
+    connectable = create_async_engine(
+        config.get_main_option("sqlalchemy.url"),
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

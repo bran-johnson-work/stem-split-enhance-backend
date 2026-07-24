@@ -235,3 +235,85 @@ async def test_verify_email_confirm_invalid_token_returns_400(client, monkeypatc
         "/api/v1/auth/verify-email/confirm", json={"token": "bad-token"}
     )
     assert resp.status_code == 400
+
+
+# ---- refresh token flow ---------------------------------------------------
+
+
+async def test_login_returns_a_refresh_token(client, monkeypatch, sample_user):
+    """The session credential the client needs to stay signed in."""
+    sample_user.is_verified = True
+    monkeypatch.setattr(
+        auth_module.user_service, "authenticate", AsyncMock(return_value=sample_user)
+    )
+    monkeypatch.setattr(
+        auth_module.auth_service, "issue_refresh_token", AsyncMock(return_value="refresh-abc")
+    )
+
+    resp = await client.post(
+        "/api/v1/auth/login",
+        data={"username": sample_user.email, "password": "secret123"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["refresh_token"] == "refresh-abc"
+    assert body["access_token"]
+    assert body["token_type"] == "bearer"
+    # The client refreshes proactively, so it needs the access token's lifetime.
+    assert body["expires_in"] > 0
+
+
+async def test_refresh_returns_new_access_and_refresh_tokens(
+    client, monkeypatch, sample_user
+):
+    monkeypatch.setattr(
+        auth_module.auth_service,
+        "rotate_refresh_token",
+        AsyncMock(return_value=(sample_user, "refresh-new")),
+    )
+
+    resp = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": "refresh-old"}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["access_token"]
+    # Rotation: the caller must receive — and store — a different token.
+    assert body["refresh_token"] == "refresh-new"
+
+
+async def test_refresh_with_a_bad_token_returns_401(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_module.auth_service,
+        "rotate_refresh_token",
+        AsyncMock(side_effect=auth_module.RefreshError("nope")),
+    )
+
+    resp = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": "stolen-or-expired"}
+    )
+
+    assert resp.status_code == 401
+    # Must not leak which failure mode it was.
+    detail = resp.json()["detail"].lower()
+    assert "expired" not in detail or "already used" not in detail
+
+
+async def test_refresh_requires_a_token(client):
+    resp = await client.post("/api/v1/auth/refresh", json={})
+    assert resp.status_code == 422
+
+
+async def test_refresh_is_anonymous(client, monkeypatch, sample_user):
+    """No Authorization header: the whole point is that the access token is dead."""
+    monkeypatch.setattr(
+        auth_module.auth_service,
+        "rotate_refresh_token",
+        AsyncMock(return_value=(sample_user, "refresh-new")),
+    )
+    resp = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": "refresh-old"}
+    )
+    assert resp.status_code == 200
