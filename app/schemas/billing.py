@@ -69,6 +69,9 @@ class SubscriptionResponse(BaseModel):
     has_subscription: bool
     status: SubscriptionStatus | None
     plan: PlanResponse
+    # Cadence the subscription is billed on. None for a free/unknown row; the
+    # frontend defaults such a case to monthly.
+    interval: BillingInterval | None = None
     current_period_start: datetime | None
     current_period_end: datetime | None
     # True => active but will not renew; ends at ``current_period_end``.
@@ -114,6 +117,7 @@ class SubscriptionCreate(BaseModel):
     status: SubscriptionStatus = SubscriptionStatus.INCOMPLETE
     stripe_customer_id: str | None = None
     stripe_subscription_id: str | None = None
+    billing_interval: str | None = None
     current_period_start: datetime | None = None
     current_period_end: datetime | None = None
     cancel_at_period_end: bool = False
@@ -125,6 +129,7 @@ class SubscriptionUpdate(BaseModel):
     status: SubscriptionStatus | None = None
     stripe_customer_id: str | None = None
     stripe_subscription_id: str | None = None
+    billing_interval: str | None = None
     current_period_start: datetime | None = None
     current_period_end: datetime | None = None
     cancel_at_period_end: bool | None = None

@@ -134,6 +134,24 @@ async def cancel_subscription(
     return subscription
 
 
+@router.post("/resume", response_model=SubscriptionResponse)
+async def resume_subscription(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Undo a scheduled cancellation, keeping the subscription on to renew."""
+    try:
+        subscription = await billing_service.resume_subscription(db, user=current_user)
+    except BillingDisabledError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Billing is not available.")
+    except BillingRequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    except StripeError:
+        logger.exception("Stripe resume failed for user %s", current_user.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
+    return subscription
+
+
 @router.post("/webhook", include_in_schema=False)
 async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)) -> dict:
     """Stripe webhook receiver — the source of truth for subscription state.

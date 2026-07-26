@@ -40,6 +40,12 @@ class Subscription(Base, TimestampMixin):
     stripe_subscription_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True, index=True
     )
+    # Which cadence the subscription was purchased on ("monthly"/"annual"). Set
+    # from the Stripe price's recurring interval on each subscription sync;
+    # nullable because Stripe doesn't carry it on every object and legacy rows
+    # predate it. Stored as a plain string (not a DB enum) to keep the column
+    # cheap to add and forward-compatible with any future cadence.
+    billing_interval: Mapped[str | None] = mapped_column(String(16), nullable=True)
     current_period_start: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -78,6 +78,25 @@ def _first_price_id(subscription_obj: dict[str, Any]) -> str | None:
         return None
 
 
+# Stripe's price.recurring.interval -> our stored cadence. Only month/year are
+# offered; anything else (or a missing recurring block) leaves it unknown.
+_INTERVAL_MAP = {"month": "monthly", "year": "annual"}
+
+
+def _first_interval(subscription_obj: dict[str, Any]) -> str | None:
+    """The billing cadence ("monthly"/"annual") from a Stripe subscription object.
+
+    Read off the first item's price recurring interval, which the subscription
+    row doesn't otherwise persist. Returns ``None`` when it can't be determined
+    so an existing value isn't clobbered with a guess.
+    """
+    try:
+        interval = subscription_obj["items"]["data"][0]["price"]["recurring"]["interval"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return _INTERVAL_MAP.get(interval)
+
+
 # Stripe invoice.status -> the three states the UI renders. Anything unpayable
 # (voided, written off) reads as a failed charge; a draft hasn't been issued yet
 # but is filtered out before this map is reached.
@@ -172,6 +191,7 @@ class BillingService:
                 has_subscription=True,
                 status=subscription.status,
                 plan=PlanResponse.model_validate(subscription.plan),
+                interval=subscription.billing_interval,
                 current_period_start=subscription.current_period_start,
                 current_period_end=subscription.current_period_end,
                 cancel_at_period_end=subscription.cancel_at_period_end,
@@ -293,6 +313,33 @@ class BillingService:
                 subscription_id=subscription.stripe_subscription_id
             )
 
+        await self._on_subscription_upsert(db, obj)
+        await db.commit()
+        return await self.get_subscription_view(db, user.id)
+
+    async def resume_subscription(
+        self, db: AsyncSession, *, user: User
+    ) -> SubscriptionResponse | None:
+        """Undo a scheduled cancellation (clear ``cancel_at_period_end``).
+
+        The mirror of :meth:`cancel_subscription`: only valid while the sub is
+        still live but set to lapse at period end. Reuses the webhook sync path,
+        so the follow-up ``customer.subscription.updated`` is an idempotent no-op.
+        Raises :class:`BillingRequestError` when there's nothing to resume.
+        """
+        settings = get_settings()
+        if not settings.billing_enabled:
+            raise BillingDisabledError("Billing is not configured.")
+
+        subscription = await subscription_repository.get_for_user(db, user.id)
+        if subscription is None or not subscription.stripe_subscription_id:
+            raise BillingRequestError("No subscription to resume.")
+        if not subscription.cancel_at_period_end:
+            raise BillingRequestError("This subscription isn't scheduled to cancel.")
+
+        obj = await stripe.resume_subscription(
+            subscription_id=subscription.stripe_subscription_id
+        )
         await self._on_subscription_upsert(db, obj)
         await db.commit()
         return await self.get_subscription_view(db, user.id)
@@ -429,6 +476,11 @@ class BillingService:
             fields["stripe_customer_id"] = sub_obj["customer"]
         if plan is not None:
             fields["plan_id"] = plan.id
+        # Only overwrite the cadence when we could actually read it, so a later
+        # event that omits the price detail doesn't wipe a known value.
+        interval = _first_interval(sub_obj)
+        if interval is not None:
+            fields["billing_interval"] = interval
 
         existing = await self._resolve_subscription(db, sub_obj)
         if existing is not None:

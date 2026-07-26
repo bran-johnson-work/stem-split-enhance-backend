@@ -61,7 +61,12 @@ def main() -> None:
         raise
 
     mb = settings.max_upload_size_bytes // (1024 * 1024)
-    print(f"[info] uploads are capped at {mb} MB by the presign policy, not the bucket")
+    print(
+        "[info] upload size is enforced per-upload by the presign policy (not the "
+        "bucket): each POST carries the caller's own plan max_file_size_mb. The "
+        f"{mb} MB MAX_UPLOAD_SIZE_BYTES is only a fallback for when a user's plan "
+        "can't be resolved — seed the plans table so paid tiers aren't capped to it."
+    )
 
 
 if __name__ == "__main__":
