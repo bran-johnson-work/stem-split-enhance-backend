@@ -29,12 +29,15 @@ def test_cors_origin_list_wildcard():
 
 def test_active_database_url_prefers_pooled():
     # Legacy fallback path (no POSTGRES_* components): app prefers the pooled URL.
-    settings = Settings(database_url="direct-url", database_url_pooled="pooled-url")
+    # postgres_host is pinned empty so a local dev .env (which sets it) can't leak in.
+    settings = Settings(
+        postgres_host="", database_url="direct-url", database_url_pooled="pooled-url"
+    )
     assert settings.active_database_url == "pooled-url"
 
 
 def test_active_database_url_falls_back_to_direct():
-    settings = Settings(database_url="direct-url", database_url_pooled="")
+    settings = Settings(postgres_host="", database_url="direct-url", database_url_pooled="")
     assert settings.active_database_url == "direct-url"
 
 
@@ -87,9 +90,11 @@ def test_asyncpg_connect_args_pooler_workaround_only_for_supabase():
     # RDS: no prepared-statement workaround.
     rds = Settings(postgres_host="rds-host").asyncpg_connect_args()
     assert "prepared_statement_name_func" not in rds
-    # Legacy Supabase pooler URL: workaround kicks in.
+    # Legacy Supabase pooler URL: workaround kicks in (postgres_host pinned empty
+    # so a local dev .env can't route active_database_url away from the pooler).
     pooler = Settings(
-        database_url_pooled="postgresql+asyncpg://u:p@aws-0-us-east-2.pooler.supabase.com:6543/postgres"
+        postgres_host="",
+        database_url_pooled="postgresql+asyncpg://u:p@aws-0-us-east-2.pooler.supabase.com:6543/postgres",
     ).asyncpg_connect_args()
     assert pooler["statement_cache_size"] == 0
     assert pooler["prepared_statement_cache_size"] == 0

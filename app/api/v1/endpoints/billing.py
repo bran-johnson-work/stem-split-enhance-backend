@@ -10,6 +10,7 @@ from app.core.stripe import SignatureVerificationError, StripeError
 from app.models.user import User
 from app.schemas.billing import (
     CancelRequest,
+    ChangePlanRequest,
     CheckoutRequest,
     CheckoutResponse,
     InvoiceResponse,
@@ -107,6 +108,37 @@ async def create_portal(
         logger.exception("Stripe portal failed for user %s", current_user.id)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
     return PortalResponse(portal_url=url)
+
+
+@router.post("/change-plan", response_model=SubscriptionResponse)
+async def change_plan(
+    payload: ChangePlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Switch an existing subscription to another plan/cadence, in place (prorated).
+
+    For a user who already has an active paid subscription — the in-app plan
+    picker calls this instead of opening the Stripe portal. New subscribers go
+    through ``/checkout``; moving to the free plan goes through ``/cancel``.
+    """
+    try:
+        subscription = await billing_service.change_plan(
+            db,
+            user=current_user,
+            plan_name=payload.plan_name.value,
+            interval=payload.interval.value,
+        )
+    except BillingDisabledError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Billing is not available.")
+    except PlanNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except BillingRequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    except StripeError:
+        logger.exception("Stripe plan change failed for user %s", current_user.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
+    return subscription
 
 
 @router.post("/cancel", response_model=SubscriptionResponse)

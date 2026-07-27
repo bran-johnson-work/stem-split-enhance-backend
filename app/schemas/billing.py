@@ -48,6 +48,18 @@ class CheckoutRequest(BaseModel):
     interval: BillingInterval = BillingInterval.MONTHLY
 
 
+class ChangePlanRequest(BaseModel):
+    """Switch an existing subscription to ``plan_name`` on a billing ``interval``.
+
+    Unlike checkout this never creates a second subscription — it swaps the price
+    on the live one, prorated. The client sends only the plan/interval; the server
+    resolves the Stripe price so a user can't move to a price they weren't offered.
+    """
+
+    plan_name: PlanName
+    interval: BillingInterval = BillingInterval.MONTHLY
+
+
 class CheckoutResponse(BaseModel):
     checkout_url: str
 

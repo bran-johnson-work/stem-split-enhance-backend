@@ -147,6 +147,60 @@ async def test_subscription_upsert_creates_when_absent(fake_db, monkeypatch):
     assert created.stripe_subscription_id == "sub_123"
 
 
+def test_first_period_prefers_item_then_top_level():
+    # New Stripe API: period lives on the item (annual sub => end a year out).
+    item_shape = {
+        "current_period_start": 1_785_170_120,
+        "items": {"data": [{"current_period_start": 1_785_170_120,
+                            "current_period_end": 1_816_706_120}]},
+    }
+    assert bsvc._first_period(item_shape) == (1_785_170_120, 1_816_706_120)
+    # Old API: period at the top level, item carries none.
+    top_shape = {
+        "current_period_start": 100,
+        "current_period_end": 200,
+        "items": {"data": [{"id": "si_1", "price": {"id": "p"}}]},
+    }
+    assert bsvc._first_period(top_shape) == (100, 200)
+
+
+async def test_subscription_upsert_captures_item_level_period(fake_db, monkeypatch):
+    """An annual sub reports its period on the item; the upsert must store it."""
+    plan = MagicMock()
+    plan.id = uuid.uuid4()
+    existing = MagicMock()
+    monkeypatch.setattr(
+        bsvc.plan_repository, "get_by_stripe_price_id", AsyncMock(return_value=plan)
+    )
+    sub_repo = MagicMock()
+    sub_repo.get_by_stripe_subscription_id = AsyncMock(return_value=existing)
+    sub_repo.update = AsyncMock()
+    monkeypatch.setattr(bsvc, "subscription_repository", sub_repo)
+
+    sub_obj = {
+        "object": "subscription",
+        "id": "sub_annual",
+        "customer": "cus_1",
+        "status": "active",
+        # Top-level period fields absent (new API version) — only the item has them.
+        "items": {
+            "data": [
+                {
+                    "id": "si_1",
+                    "price": {"id": "price_x", "recurring": {"interval": "year"}},
+                    "current_period_start": 1_785_170_120,
+                    "current_period_end": 1_816_706_120,
+                }
+            ]
+        },
+    }
+    await BillingService()._on_subscription_upsert(fake_db, sub_obj)
+
+    fields = sub_repo.update.await_args.args[2]
+    assert fields["current_period_end"] == bsvc._ts(1_816_706_120)
+    assert fields["billing_interval"] == "annual"
+
+
 async def test_subscription_upsert_updates_existing(fake_db, monkeypatch):
     plan = MagicMock()
     plan.id = uuid.uuid4()
@@ -333,6 +387,189 @@ async def test_portal_without_account_returns_400(auth_client, monkeypatch):
         AsyncMock(side_effect=BillingRequestError("No billing account exists for this user yet.")),
     )
     resp = await auth_client.post("/api/v1/billing/portal")
+    assert resp.status_code == 400
+
+
+async def test_change_plan_swaps_price_in_place(fake_db, monkeypatch):
+    """A plan change retrieves the sub, swaps its item's price, and syncs back."""
+    plan = _plan_orm("pro", price_monthly_cents=2900, max_projects_per_month=None)
+    plan.stripe_price_id_monthly = "price_pro_monthly"
+    current = _plan_orm("creator", price_monthly_cents=1200)
+    existing = MagicMock()
+    existing.stripe_subscription_id = "sub_1"
+    existing.plan = current
+    existing.billing_interval = "monthly"
+
+    sub_repo = MagicMock()
+    sub_repo.get_for_user = AsyncMock(return_value=existing)
+    monkeypatch.setattr(bsvc, "subscription_repository", sub_repo)
+    monkeypatch.setattr(
+        bsvc.plan_repository, "get_by_name", AsyncMock(return_value=plan)
+    )
+
+    retrieve_mock = AsyncMock(
+        return_value={
+            "object": "subscription",
+            "id": "sub_1",
+            "items": {"data": [{"id": "si_1", "price": {"id": "price_creator_monthly"}}]},
+        }
+    )
+    update_mock = AsyncMock(return_value={"object": "subscription", "id": "sub_1"})
+    monkeypatch.setattr(bsvc.stripe, "retrieve_subscription", retrieve_mock)
+    monkeypatch.setattr(bsvc.stripe, "update_subscription_price", update_mock)
+    monkeypatch.setattr(BillingService, "_on_subscription_upsert", AsyncMock())
+    monkeypatch.setattr(BillingService, "get_subscription_view", AsyncMock(return_value=None))
+    monkeypatch.setattr(get_settings(), "stripe_secret_key", "sk_test")
+
+    user = MagicMock()
+    user.id = uuid.uuid4()
+    await BillingService().change_plan(fake_db, user=user, plan_name="pro", interval="monthly")
+
+    update_mock.assert_awaited_once()
+    kwargs = update_mock.await_args.kwargs
+    assert kwargs["subscription_id"] == "sub_1"
+    assert kwargs["item_id"] == "si_1"
+    assert kwargs["price_id"] == "price_pro_monthly"
+    # creator (1200) -> pro (2900) is an upgrade, so it invoices now.
+    assert kwargs["proration_behavior"] == "always_invoice"
+
+
+async def test_change_plan_downgrade_credits_next_invoice(fake_db, monkeypatch):
+    plan = _plan_orm("creator", price_monthly_cents=1200)
+    plan.stripe_price_id_monthly = "price_creator_monthly"
+    current = _plan_orm("pro", price_monthly_cents=2900, max_projects_per_month=None)
+    existing = MagicMock()
+    existing.stripe_subscription_id = "sub_1"
+    existing.plan = current
+    existing.billing_interval = "monthly"
+
+    sub_repo = MagicMock()
+    sub_repo.get_for_user = AsyncMock(return_value=existing)
+    monkeypatch.setattr(bsvc, "subscription_repository", sub_repo)
+    monkeypatch.setattr(bsvc.plan_repository, "get_by_name", AsyncMock(return_value=plan))
+    monkeypatch.setattr(
+        bsvc.stripe,
+        "retrieve_subscription",
+        AsyncMock(
+            return_value={
+                "object": "subscription",
+                "id": "sub_1",
+                "items": {"data": [{"id": "si_1", "price": {"id": "price_pro_monthly"}}]},
+            }
+        ),
+    )
+    update_mock = AsyncMock(return_value={"object": "subscription", "id": "sub_1"})
+    monkeypatch.setattr(bsvc.stripe, "update_subscription_price", update_mock)
+    monkeypatch.setattr(BillingService, "_on_subscription_upsert", AsyncMock())
+    monkeypatch.setattr(BillingService, "get_subscription_view", AsyncMock(return_value=None))
+    monkeypatch.setattr(get_settings(), "stripe_secret_key", "sk_test")
+
+    user = MagicMock()
+    user.id = uuid.uuid4()
+    await BillingService().change_plan(fake_db, user=user, plan_name="creator", interval="monthly")
+    assert update_mock.await_args.kwargs["proration_behavior"] == "create_prorations"
+
+
+async def test_change_plan_noop_when_already_on_price(fake_db, monkeypatch):
+    """Selecting the current price doesn't call Stripe's update (it would 400)."""
+    plan = _plan_orm("pro", price_monthly_cents=2900, max_projects_per_month=None)
+    plan.stripe_price_id_monthly = "price_pro_monthly"
+    existing = MagicMock()
+    existing.stripe_subscription_id = "sub_1"
+    existing.plan = plan
+    existing.billing_interval = "monthly"
+
+    sub_repo = MagicMock()
+    sub_repo.get_for_user = AsyncMock(return_value=existing)
+    monkeypatch.setattr(bsvc, "subscription_repository", sub_repo)
+    monkeypatch.setattr(bsvc.plan_repository, "get_by_name", AsyncMock(return_value=plan))
+    monkeypatch.setattr(
+        bsvc.stripe,
+        "retrieve_subscription",
+        AsyncMock(
+            return_value={
+                "object": "subscription",
+                "id": "sub_1",
+                "items": {"data": [{"id": "si_1", "price": {"id": "price_pro_monthly"}}]},
+            }
+        ),
+    )
+    update_mock = AsyncMock()
+    monkeypatch.setattr(bsvc.stripe, "update_subscription_price", update_mock)
+    monkeypatch.setattr(BillingService, "get_subscription_view", AsyncMock(return_value=None))
+    monkeypatch.setattr(get_settings(), "stripe_secret_key", "sk_test")
+
+    user = MagicMock()
+    user.id = uuid.uuid4()
+    await BillingService().change_plan(fake_db, user=user, plan_name="pro", interval="monthly")
+    update_mock.assert_not_awaited()
+
+
+async def test_change_plan_without_subscription_raises(fake_db, monkeypatch):
+    plan = _plan_orm("pro", price_monthly_cents=2900, max_projects_per_month=None)
+    plan.stripe_price_id_monthly = "price_pro_monthly"
+    sub_repo = MagicMock()
+    sub_repo.get_for_user = AsyncMock(return_value=None)
+    monkeypatch.setattr(bsvc, "subscription_repository", sub_repo)
+    monkeypatch.setattr(bsvc.plan_repository, "get_by_name", AsyncMock(return_value=plan))
+    monkeypatch.setattr(get_settings(), "stripe_secret_key", "sk_test")
+
+    user = MagicMock()
+    user.id = uuid.uuid4()
+    with pytest.raises(BillingRequestError):
+        await BillingService().change_plan(fake_db, user=user, plan_name="pro", interval="monthly")
+
+
+async def test_change_plan_to_free_raises(fake_db, monkeypatch):
+    monkeypatch.setattr(
+        bsvc.plan_repository, "get_by_name", AsyncMock(return_value=_plan_orm("free"))
+    )
+    monkeypatch.setattr(get_settings(), "stripe_secret_key", "sk_test")
+    user = MagicMock()
+    user.id = uuid.uuid4()
+    with pytest.raises(BillingRequestError):
+        await BillingService().change_plan(fake_db, user=user, plan_name="free", interval="monthly")
+
+
+async def test_change_plan_endpoint_returns_updated_subscription(auth_client, monkeypatch):
+    view = SubscriptionResponse(
+        has_subscription=True,
+        status=SubscriptionStatus.ACTIVE,
+        plan=PlanResponse.model_validate(
+            _plan_orm("pro", price_monthly_cents=2900, max_projects_per_month=None)
+        ),
+        current_period_start=None,
+        current_period_end=None,
+        cancel_at_period_end=False,
+        cancelled_at=None,
+    )
+    monkeypatch.setattr(
+        bsvc.billing_service, "change_plan", AsyncMock(return_value=view)
+    )
+    resp = await auth_client.post(
+        "/api/v1/billing/change-plan", json={"plan_name": "pro", "interval": "monthly"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["plan"]["name"] == "pro"
+
+
+async def test_change_plan_endpoint_disabled_returns_503(auth_client):
+    # Default settings have no Stripe key => billing disabled.
+    resp = await auth_client.post(
+        "/api/v1/billing/change-plan", json={"plan_name": "pro", "interval": "monthly"}
+    )
+    assert resp.status_code == 503
+
+
+async def test_change_plan_endpoint_no_account_returns_400(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        bsvc.billing_service,
+        "change_plan",
+        AsyncMock(side_effect=BillingRequestError("No active subscription to change.")),
+    )
+    resp = await auth_client.post(
+        "/api/v1/billing/change-plan", json={"plan_name": "pro", "interval": "monthly"}
+    )
     assert resp.status_code == 400
 
 

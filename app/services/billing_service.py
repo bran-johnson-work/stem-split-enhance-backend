@@ -78,6 +78,43 @@ def _first_price_id(subscription_obj: dict[str, Any]) -> str | None:
         return None
 
 
+def _first_item(subscription_obj: dict[str, Any]) -> dict[str, Any] | None:
+    """The subscription's first line item (``{id, price, ...}``), or None."""
+    try:
+        item = subscription_obj["items"]["data"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return item if isinstance(item, dict) else None
+
+
+def _first_period(subscription_obj: dict[str, Any]) -> tuple[Any, Any]:
+    """The current billing period ``(start, end)`` as raw Stripe timestamps.
+
+    Newer Stripe API versions report ``current_period_start`` / ``current_period_end``
+    on the subscription **item**, not the subscription object; older versions put
+    them at the top level. Read the item first and fall back, so the renewal date
+    is captured on every version — otherwise an annual sub (item period a year out)
+    stores a null period end and the app can't show when it renews.
+    """
+    item = _first_item(subscription_obj) or {}
+    start = item.get("current_period_start") or subscription_obj.get("current_period_start")
+    end = item.get("current_period_end") or subscription_obj.get("current_period_end")
+    return start, end
+
+
+# Months in a year — used to annualise a monthly price so a monthly plan and an
+# annual plan can be compared on the same footing (upgrade vs downgrade).
+_MONTHS_PER_YEAR = 12
+
+
+def _annualised_cents(plan: Plan, interval: str) -> int:
+    """A plan's yearly cost for the given cadence, so plans on different cadences
+    (monthly vs annual) compare like-for-like when classifying a change."""
+    if interval == "annual":
+        return plan.price_annual_cents
+    return plan.price_monthly_cents * _MONTHS_PER_YEAR
+
+
 # Stripe's price.recurring.interval -> our stored cadence. Only month/year are
 # offered; anything else (or a missing recurring block) leaves it unknown.
 _INTERVAL_MAP = {"month": "monthly", "year": "annual"}
@@ -286,6 +323,69 @@ class BillingService:
         )
         return session["url"]
 
+    async def change_plan(
+        self, db: AsyncSession, *, user: User, plan_name: str, interval: str
+    ) -> SubscriptionResponse | None:
+        """Switch an existing subscription to a different plan/cadence, in place.
+
+        Swaps the price on the live Stripe subscription (never a second one) and
+        prorates: an upgrade is invoiced now, a downgrade books a credit toward
+        the next invoice. Reuses the webhook sync path so the follow-up
+        ``customer.subscription.updated`` is an idempotent no-op. A no-op change
+        (already on this exact price) returns the current view without calling
+        Stripe. Moving *to* the free plan isn't a price swap — cancel instead.
+        """
+        settings = get_settings()
+        if not settings.billing_enabled:
+            raise BillingDisabledError("Billing is not configured.")
+
+        plan = await plan_repository.get_by_name(db, plan_name)
+        if plan is None or not plan.is_active:
+            raise PlanNotFoundError(f"Unknown plan '{plan_name}'.")
+        if plan.price_monthly_cents == 0 and plan.price_annual_cents == 0:
+            raise BillingRequestError(
+                "Cancel your subscription to move to the free plan."
+            )
+
+        price_id = (
+            plan.stripe_price_id_annual if interval == "annual" else plan.stripe_price_id_monthly
+        )
+        if not price_id:
+            raise BillingRequestError(
+                f"Plan '{plan_name}' is not available for {interval} billing yet."
+            )
+
+        subscription = await subscription_repository.get_for_user(db, user.id)
+        if subscription is None or not subscription.stripe_subscription_id:
+            raise BillingRequestError("No active subscription to change.")
+
+        stripe_sub = await stripe.retrieve_subscription(
+            subscription_id=subscription.stripe_subscription_id
+        )
+        current_item = _first_item(stripe_sub)
+        if current_item is None or "id" not in current_item:
+            raise BillingRequestError("This subscription has no plan to change.")
+
+        # Already on the requested price/cadence — nothing to do, and Stripe would
+        # reject a swap to the same price. Report the current state.
+        if (current_item.get("price") or {}).get("id") == price_id:
+            return await self.get_subscription_view(db, user.id)
+
+        # Upgrades are billed now; downgrades book a credit for the next invoice.
+        new_cost = _annualised_cents(plan, interval)
+        old_cost = _annualised_cents(subscription.plan, subscription.billing_interval or "monthly")
+        proration = "always_invoice" if new_cost >= old_cost else "create_prorations"
+
+        obj = await stripe.update_subscription_price(
+            subscription_id=subscription.stripe_subscription_id,
+            item_id=current_item["id"],
+            price_id=price_id,
+            proration_behavior=proration,
+        )
+        await self._on_subscription_upsert(db, obj)
+        await db.commit()
+        return await self.get_subscription_view(db, user.id)
+
     async def cancel_subscription(
         self, db: AsyncSession, *, user: User, immediate: bool = False
     ) -> SubscriptionResponse | None:
@@ -464,11 +564,12 @@ class BillingService:
         price_id = _first_price_id(sub_obj)
         plan = await plan_repository.get_by_stripe_price_id(db, price_id) if price_id else None
 
+        period_start, period_end = _first_period(sub_obj)
         fields: dict[str, Any] = {
             "status": _map_status(sub_obj.get("status")),
             "stripe_subscription_id": sub_obj.get("id"),
-            "current_period_start": _ts(sub_obj.get("current_period_start")),
-            "current_period_end": _ts(sub_obj.get("current_period_end")),
+            "current_period_start": _ts(period_start),
+            "current_period_end": _ts(period_end),
             "cancel_at_period_end": bool(sub_obj.get("cancel_at_period_end")),
             "cancelled_at": _ts(sub_obj.get("canceled_at")),
         }

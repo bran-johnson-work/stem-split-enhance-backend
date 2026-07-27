@@ -138,6 +138,33 @@ async def create_price(
     )
 
 
+async def list_products(*, limit: int = 100, active: bool = True) -> list[dict[str, Any]]:
+    """List products (default: active only). Used to find an existing plan product."""
+    resp = await _get("products", {"limit": limit, "active": active})
+    data = resp.get("data")
+    return data if isinstance(data, list) else []
+
+
+async def list_prices(*, limit: int = 100, active: bool = True) -> list[dict[str, Any]]:
+    """List prices (default: active only), each carrying its ``recurring.interval``."""
+    resp = await _get("prices", {"limit": limit, "active": active})
+    data = resp.get("data")
+    return data if isinstance(data, list) else []
+
+
+async def archive_product(*, product_id: str) -> dict[str, Any]:
+    """Deactivate (archive) a product. Reversible — sets ``active=false``."""
+    return await _post(f"products/{product_id}", {"active": False})
+
+
+async def archive_price(*, price_id: str) -> dict[str, Any]:
+    """Deactivate (archive) a price. Prices can't be deleted, only deactivated.
+
+    Existing subscriptions on the price keep billing; it just can't back new ones.
+    """
+    return await _post(f"prices/{price_id}", {"active": False})
+
+
 async def create_checkout_session(
     *,
     customer_id: str,
@@ -171,6 +198,35 @@ async def create_portal_session(*, customer_id: str, return_url: str) -> dict[st
     """Create a Customer Portal session (self-serve cancel / switch / update card)."""
     return await _post(
         "billing_portal/sessions", {"customer": customer_id, "return_url": return_url}
+    )
+
+
+async def retrieve_subscription(*, subscription_id: str) -> dict[str, Any]:
+    """Fetch a subscription object (used to read its current item id before a swap)."""
+    return await _get(f"subscriptions/{subscription_id}")
+
+
+async def update_subscription_price(
+    *,
+    subscription_id: str,
+    item_id: str,
+    price_id: str,
+    proration_behavior: str = "create_prorations",
+) -> dict[str, Any]:
+    """Swap the price on an existing subscription's line item (a plan change).
+
+    Replaces the single item's price rather than adding a second one, so the
+    subscription keeps billing one plan. ``proration_behavior`` controls the
+    money: ``always_invoice`` charges the prorated difference now (upgrades),
+    ``create_prorations`` books a credit toward the next invoice (downgrades).
+    Returns the updated subscription object, reused by the webhook sync path.
+    """
+    return await _post(
+        f"subscriptions/{subscription_id}",
+        {
+            "items": [{"id": item_id, "price": price_id}],
+            "proration_behavior": proration_behavior,
+        },
     )
 
 

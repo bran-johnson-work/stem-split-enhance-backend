@@ -115,12 +115,7 @@ class ProjectService:
         """
         if plan is None:
             fallback = get_settings().max_upload_size_bytes
-            # A resolved plan is the norm; reaching this means neither an active
-            # subscription's plan nor the 'free' row could be found. A *paid* user
-            # landing here is silently capped below their tier (the classic
-            # "I'm on Pro but stuck at 50 MB" report), so make it visible: it
-            # almost always means the plans table isn't seeded (run migrations) or
-            # the subscription isn't ACTIVE/linked to a plan.
+
             logger.warning(
                 "No plan resolved for upload; falling back to max_upload_size_bytes "
                 "(%d MB). Presign is capped below any paid tier until this is fixed "
