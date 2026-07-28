@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.project import Project
+from app.models.project import Project, ProjectStatus
 from app.repositories.base_repository import BaseRepository
 from app.schemas.project import ProjectCreate, ProjectUpdate
 
@@ -74,6 +74,36 @@ class ProjectRepository(BaseRepository[Project, ProjectCreate, ProjectUpdate]):
             .where(Project.user_id == user_id, Project.created_at >= since)
         )
         return int(result.scalar_one() or 0)
+
+    async def count_all(self, db: AsyncSession) -> int:
+        """Total number of projects (all users)."""
+        result = await db.execute(select(func.count()).select_from(Project))
+        return int(result.scalar_one() or 0)
+
+    async def count_by_status(self, db: AsyncSession) -> dict[ProjectStatus, int]:
+        """Project counts grouped by status. Absent statuses are simply missing —
+        the service fills them with 0 so every enum value is represented."""
+        result = await db.execute(
+            select(Project.status, func.count()).group_by(Project.status)
+        )
+        return {status: int(count) for status, count in result.all()}
+
+    async def created_by_day(
+        self, db: AsyncSession, since: datetime
+    ) -> list[tuple[datetime, int]]:
+        """Count projects created per UTC day at/after ``since``, oldest first.
+
+        Same shape as ``UserRepository.signups_by_day`` — only non-empty days are
+        returned; the service densifies the series.
+        """
+        day = func.date_trunc("day", Project.created_at)
+        result = await db.execute(
+            select(day, func.count())
+            .where(Project.created_at >= since)
+            .group_by(day)
+            .order_by(day)
+        )
+        return [(row[0], int(row[1])) for row in result.all()]
 
 
 project_repository = ProjectRepository(Project)

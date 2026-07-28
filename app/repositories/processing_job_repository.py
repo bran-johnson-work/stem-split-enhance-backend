@@ -125,6 +125,14 @@ class ProcessingJobRepository(
         )
         return result.scalars().all()
 
+    async def count_by_status(self, db: AsyncSession) -> dict[JobStatus, int]:
+        """Job counts grouped by status (admin health view). Absent statuses are
+        missing; the service fills them with 0."""
+        result = await db.execute(
+            select(ProcessingJob.status, func.count()).group_by(ProcessingJob.status)
+        )
+        return {status: int(count) for status, count in result.all()}
+
     async def get_active_for_project(
         self, db: AsyncSession, project_id: uuid.UUID
     ) -> ProcessingJob | None:
