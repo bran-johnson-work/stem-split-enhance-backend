@@ -107,15 +107,16 @@ def finalize_stem(
     sr: int,
     reference: np.ndarray | None = None,
     want_enhancement: bool = True,
+    level: str = "full",
 ) -> tuple[np.ndarray, bool]:
     """Return (deliverable_audio_channel_last, is_enhanced) ready for sf.write.
 
-    Tonal stems get the full restoration chain when ``want_enhancement`` is set; drum
-    sub-stems (and everything when enhancement is off) are only peak-normalized so their
-    transients are not smeared by saturation/exciter processing.
+    Tonal stems get the restoration chain (at intensity ``level``: "full" or "light") when
+    ``want_enhancement`` is set; drum sub-stems (and everything when enhancement is off) are
+    only peak-normalized so their transients are not smeared by saturation/exciter processing.
     """
     if want_enhancement and name in ENHANCE_STEMS:
-        out = enhance_stem(audio, sr, name, reference=reference)
+        out = enhance_stem(audio, sr, name, reference=reference, level=level)
         is_enhanced = True
     else:
         out = _safety_limit(audio)
@@ -141,6 +142,14 @@ def separate_and_finalize(
     the reference-guided matching against a clean section of the same track.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve the restoration intensity from Settings. "off" (or want_enhancement=False)
+    # short-circuits the whole chain; "light"/"full" pick how aggressive enhance_stem is.
+    level = (get_settings().enhancement_level or "full").strip().lower()
+    if level not in ("full", "light", "off"):
+        level = "full"
+    if level == "off":
+        want_enhancement = False
 
     def step(progress: float, label: str) -> None:
         if on_step:
@@ -168,7 +177,7 @@ def separate_and_finalize(
         step(66.0 + idx / len(present) * 32.0, label)
 
         out, is_enhanced = finalize_stem(
-            name, stem, sr, reference=reference, want_enhancement=want_enhancement
+            name, stem, sr, reference=reference, want_enhancement=want_enhancement, level=level
         )
         path = out_dir / f"{name}.wav"
         sf.write(str(path), out, sr, subtype="PCM_24")

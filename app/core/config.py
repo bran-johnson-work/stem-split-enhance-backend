@@ -132,6 +132,25 @@ class Settings(BaseSettings):
     enable_enhancement: bool = True
     worker_poll_interval_seconds: float = 5.0
 
+    # --- Separation-quality knobs (the levers against stem bleed / crosstalk) ---
+    # shifts = demucs test-time augmentation: run apply_model N times with random phase
+    # shifts and average. This is the single biggest lever for reducing bleed between
+    # stems (e.g. vocals leaking into "other"), at ~linear CPU/GPU cost. 1 = fastest/POC,
+    # 2-5 = noticeably cleaner, 10 = diminishing returns. Set 2 on a GPU box in prod.
+    demucs_shifts: int = 1
+    # overlap = fraction of overlap between the analysis chunks apply_model splits into.
+    # Higher = smoother seams and slightly better separation; 0.25 is fast, 0.5 is the
+    # demucs default and the recommended prod value. Range (0, 1).
+    demucs_overlap: float = 0.5
+    # Post-separation restoration intensity: "full" | "light" | "off".
+    #   full  = the Suno-artifact chain (denoise + declick + exciter + multiband saturation);
+    #           great for AI-generated audio, but can over-process clean real recordings.
+    #   light = gentle denoise + safety-limit only (most faithful for real mixes).
+    #   off   = peak-normalize only (raw separated level).
+    # Left as "full" to preserve current behavior; flip to "light" if real-music stems
+    # come out over-processed / "messy". `enable_enhancement=False` still forces "off".
+    enhancement_level: str = "full"
+
     # --- Progress-write debounce (RCA-3) ---
     # Sample every poll_seconds, but only write on a label change, a jump >= min_delta,
     # or once min_interval_seconds has passed (liveness tick, so long stages don't look frozen).
