@@ -10,7 +10,13 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import SlidingWindowRateLimiter
 from app.core.security import create_access_token
-from app.schemas.email import MessageResponse, VerificationRequest, VerifyEmailRequest
+from app.schemas.email import (
+    ForgotPasswordRequest,
+    MessageResponse,
+    ResetPasswordRequest,
+    VerificationRequest,
+    VerifyEmailRequest,
+)
 from app.schemas.user import (
     LogoutRequest,
     RefreshRequest,
@@ -232,3 +238,48 @@ async def confirm_email_verification(
             detail="Invalid or expired verification token.",
         )
     return MessageResponse(detail="Email verified successfully.")
+
+
+@router.post("/forgot-password", response_model=MessageResponse)
+async def forgot_password(
+    request: Request,
+    body: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Send a password-reset link to the given address.
+
+    Always returns the same generic message so the endpoint can't be used to
+    probe which addresses have accounts. The email is only actually sent when a
+    matching, active user exists.
+    """
+    _enforce_signup_rate_limit(request)
+    user = await user_service.repository.get_by_email(db, body.email)
+    if user is not None and user.is_active:
+        background_tasks.add_task(email_service.send_password_reset_email, user)
+    else:
+        logger.info("Password reset requested for non-eligible email=%s", body.email)
+    return MessageResponse(
+        detail="If an account exists for that address, a password reset email has been sent."
+    )
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+async def reset_password(
+    body: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Set a new password using the token from the reset link.
+
+    On success every existing session is revoked, so the user (and anyone who may
+    have compromised the account) must log in again with the new password.
+    """
+    user = await email_service.reset_password(db, body.token, body.new_password)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+    return MessageResponse(
+        detail="Password reset successfully. Please log in with your new password."
+    )

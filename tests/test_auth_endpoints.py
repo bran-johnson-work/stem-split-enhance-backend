@@ -237,6 +237,91 @@ async def test_verify_email_confirm_invalid_token_returns_400(client, monkeypatc
     assert resp.status_code == 400
 
 
+# ---- forgot / reset password ----------------------------------------------
+
+
+async def test_forgot_password_sends_for_active_user(client, monkeypatch, sample_user):
+    sample_user.is_active = True
+    monkeypatch.setattr(
+        auth_module.user_service.repository, "get_by_email", AsyncMock(return_value=sample_user)
+    )
+    send = AsyncMock(return_value="msg_1")
+    monkeypatch.setattr(auth_module.email_service, "send_password_reset_email", send)
+
+    resp = await client.post(
+        "/api/v1/auth/forgot-password", json={"email": sample_user.email}
+    )
+    assert resp.status_code == 200
+    send.assert_awaited_once_with(sample_user)
+
+
+async def test_forgot_password_is_generic_for_unknown_email(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_module.user_service.repository, "get_by_email", AsyncMock(return_value=None)
+    )
+    send = AsyncMock()
+    monkeypatch.setattr(auth_module.email_service, "send_password_reset_email", send)
+
+    resp = await client.post(
+        "/api/v1/auth/forgot-password", json={"email": "ghost@example.com"}
+    )
+    # Same 200 + message whether or not the account exists (no enumeration).
+    assert resp.status_code == 200
+    assert "if an account exists" in resp.json()["detail"].lower()
+    send.assert_not_awaited()
+
+
+async def test_forgot_password_skips_inactive_user(client, monkeypatch, sample_user):
+    sample_user.is_active = False
+    monkeypatch.setattr(
+        auth_module.user_service.repository, "get_by_email", AsyncMock(return_value=sample_user)
+    )
+    send = AsyncMock()
+    monkeypatch.setattr(auth_module.email_service, "send_password_reset_email", send)
+
+    resp = await client.post(
+        "/api/v1/auth/forgot-password", json={"email": sample_user.email}
+    )
+    assert resp.status_code == 200
+    send.assert_not_awaited()
+
+
+async def test_forgot_password_rejects_invalid_email(client):
+    resp = await client.post("/api/v1/auth/forgot-password", json={"email": "not-an-email"})
+    assert resp.status_code == 422
+
+
+async def test_reset_password_success(client, monkeypatch, sample_user):
+    monkeypatch.setattr(
+        auth_module.email_service, "reset_password", AsyncMock(return_value=sample_user)
+    )
+    resp = await client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": "valid-token", "new_password": "new-password-123"},
+    )
+    assert resp.status_code == 200
+    assert "reset" in resp.json()["detail"].lower()
+
+
+async def test_reset_password_invalid_token_returns_400(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_module.email_service, "reset_password", AsyncMock(return_value=None)
+    )
+    resp = await client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": "bad-token", "new_password": "new-password-123"},
+    )
+    assert resp.status_code == 400
+
+
+async def test_reset_password_rejects_short_password(client):
+    resp = await client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": "valid-token", "new_password": "short"},
+    )
+    assert resp.status_code == 422
+
+
 # ---- refresh token flow ---------------------------------------------------
 
 

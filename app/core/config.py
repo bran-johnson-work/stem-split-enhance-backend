@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     jwt_issuer: str = "ai-audio-stem-api"
     jwt_audience: str = "ai-audio-stem-api-clients"
     jwt_email_verification_audience: str = "ai-audio-stem-api-email-verification"
+    jwt_password_reset_audience: str = "ai-audio-stem-api-password-reset"
     access_token_expire_minutes: int = 30
     # Refresh-token lifetime. The access token stays short (a stolen one expires
     # fast); this is what actually keeps a user signed in, since the client
@@ -103,6 +104,9 @@ class Settings(BaseSettings):
     email_timeout_seconds: float = 10.0
     frontend_url: str = "http://localhost:3000"
     email_verification_token_expire_hours: int = 24
+    # Password-reset links are shorter-lived than verification links: a reset grants
+    # account takeover, so the window for a leaked link to be abused is kept small.
+    password_reset_token_expire_hours: int = 1
 
     require_email_verification: bool = True
 

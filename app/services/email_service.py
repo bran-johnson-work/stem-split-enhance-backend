@@ -10,9 +10,13 @@ from app.core.config import get_settings
 from app.core.email import send_email
 from app.core.security import (
     create_email_verification_token,
+    create_password_reset_token,
     decode_email_verification_token,
+    decode_password_reset_token,
+    hash_password,
 )
 from app.models.user import User
+from app.repositories.refresh_token_repository import refresh_token_repository
 from app.repositories.revoked_token_repository import revoked_token_repository
 from app.repositories.user_repository import user_repository
 
@@ -124,13 +128,19 @@ class EmailService:
 
     def __init__(self) -> None:
         self.repository = user_repository
-        # Reused as a single-use guard: a consumed verification jti is denylisted.
+        # Reused as a single-use guard: a consumed verification/reset jti is denylisted.
         self.revoked_tokens = revoked_token_repository
+        self.refresh_tokens = refresh_token_repository
 
     def _verification_link(self, token: str) -> str:
         settings = get_settings()
         base = settings.frontend_url.rstrip("/")
         return f"{base}/verify-email?token={quote(token)}"
+
+    def _password_reset_link(self, token: str) -> str:
+        settings = get_settings()
+        base = settings.frontend_url.rstrip("/")
+        return f"{base}/reset-password?token={quote(token)}"
 
     async def send_verification_email(self, user: User) -> str | None:
         """Send an email-verification link to ``user``.
@@ -181,6 +191,108 @@ class EmailService:
         except Exception:  # pragma: no cover - defensive; send_email logs details
             logger.exception("Failed to send verification email to %s", user.email)
             return None
+
+    async def send_password_reset_email(self, user: User) -> str | None:
+        """Send a password-reset link to ``user``.
+
+        Returns the provider message id, or ``None`` if email is disabled. Never
+        raises: a failed reset email should not break the endpoint that triggered
+        it (which stays generic to avoid account enumeration). The error is logged.
+        """
+        token = create_password_reset_token(str(user.id), user.email)
+        link = self._password_reset_link(token)
+
+        if get_settings().is_local:
+            logger.info("Local password-reset link for %s: %s", user.email, link)
+        greeting = f"Hi {user.full_name}," if user.full_name else "Hey there,"
+        html = _wrap(
+            "Reset your password",
+            f'<p style="margin:0 0 16px">{greeting}</p>'
+            '<p style="margin:0 0 16px">We received a request to reset the password '
+            "for your KlearNote account. Tap the button below to choose a new one:</p>"
+            f"{_button(link, 'Reset my password')}"
+            '<p style="margin:0 0 8px;font-size:13px;color:#94a3b8">'
+            "Button not working? Paste this link into your browser:</p>"
+            f'<p style="margin:0 0 24px;font-size:13px;word-break:break-all">'
+            f'<a href="{link}" style="color:{_BRAND_ACCENT};text-decoration:none">'
+            f"{link}</a></p>"
+            f'<div style="border-top:1px solid #eef0f6;margin:24px 0 0;padding-top:16px">'
+            '<p style="margin:0;font-size:13px;color:#94a3b8">This link expires in '
+            "1 hour. If you didn't request a password reset, you can safely ignore "
+            "this email — your password won't change.</p></div>",
+            preheader="Reset your KlearNote password.",
+        )
+        try:
+            return await send_email(
+                to=user.email,
+                subject="Reset your password · KlearNote",
+                html=html,
+                text=(
+                    f"{greeting}\n\n"
+                    "We received a request to reset your KlearNote password. Use this "
+                    f"link to choose a new one:\n{link}\n\n"
+                    "This link expires in 1 hour. If you didn't request a password "
+                    "reset, you can ignore this email — your password won't change."
+                ),
+            )
+        except Exception:  # pragma: no cover - defensive; send_email logs details
+            logger.exception("Failed to send password-reset email to %s", user.email)
+            return None
+
+    async def reset_password(
+        self, db: AsyncSession, token: str, new_password: str
+    ) -> User | None:
+        """Validate a reset token and set the user's new password.
+
+        Single-use: the token's ``jti`` is denylisted once consumed, so the same
+        link cannot be replayed. On success every live refresh token for the user
+        is revoked ("sign out everywhere") — a password reset is exactly the moment
+        to end any session an attacker may hold. Returns the user on success, or
+        ``None`` if the token is invalid/expired/already-used, its subject no longer
+        exists (or is inactive), or its bound email no longer matches.
+        """
+        try:
+            payload = decode_password_reset_token(token)
+        except jwt.PyJWTError as exc:
+            logger.info("Rejected password-reset token: %s", exc)
+            return None
+
+        jti = payload.get("jti")
+        if jti and await self.revoked_tokens.is_revoked(db, jti):
+            logger.info("Rejected already-used password-reset token jti=%s", jti)
+            return None
+
+        try:
+            user_id = uuid.UUID(str(payload.get("sub")))
+        except ValueError:
+            return None
+
+        user = await self.repository.get(db, user_id)
+        if user is None or not user.is_active:
+            return None
+        # Guard against a token issued before the user changed their email.
+        if payload.get("email") and payload["email"] != user.email:
+            logger.info("Password-reset token email mismatch for user_id=%s", user_id)
+            return None
+
+        # Consume the token (single-use), set the new hash, and end all sessions —
+        # all in one transaction.
+        if jti:
+            expires_at = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc)
+            await self.revoked_tokens.add(db, jti, expires_at)
+        # Completing a reset over an emailed link also proves email ownership.
+        updates: dict = {"password_hash": hash_password(new_password)}
+        if not user.is_verified:
+            updates["is_verified"] = True
+        user = await self.repository.update(db, user, updates)
+        revoked = await self.refresh_tokens.revoke_all_for_user(db, user.id)
+        await db.commit()
+        logger.info(
+            "Password reset for user_id=%s (token consumed, %d session(s) revoked)",
+            user_id,
+            revoked,
+        )
+        return user
 
     async def verify_email_token(self, db: AsyncSession, token: str) -> User | None:
         """Validate a verification token and mark the user's email as verified.

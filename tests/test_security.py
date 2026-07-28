@@ -139,3 +139,54 @@ def test_access_token_cannot_be_used_as_verification_token():
     token = security.create_access_token({"sub": "user-1"})
     with pytest.raises(jwt.PyJWTError):
         security.decode_email_verification_token(token)
+
+
+# --- Password-reset tokens ----------------------------------------------------
+
+
+def test_password_reset_token_has_expiry_and_claims():
+    settings = get_settings()
+    token = security.create_password_reset_token("user-1", "u@example.com")
+    payload = security.decode_password_reset_token(token)
+    assert payload["sub"] == "user-1"
+    assert payload["email"] == "u@example.com"
+    assert payload["purpose"] == security.PASSWORD_RESET_PURPOSE
+    assert payload["aud"] == settings.jwt_password_reset_audience
+    for claim in ("iat", "nbf", "exp", "jti"):
+        assert claim in payload
+
+
+def test_password_reset_token_expiry_is_config_driven():
+    settings = get_settings()
+    payload = security.decode_password_reset_token(
+        security.create_password_reset_token("x", "u@example.com")
+    )
+    span_hours = (payload["exp"] - payload["iat"]) / 3600
+    assert round(span_hours) == settings.password_reset_token_expire_hours
+
+
+def test_expired_password_reset_token_is_rejected(monkeypatch):
+    monkeypatch.setattr(security.settings, "password_reset_token_expire_hours", -1)
+    token = security.create_password_reset_token("x", "u@example.com")
+    with pytest.raises(jwt.ExpiredSignatureError):
+        security.decode_password_reset_token(token)
+
+
+def test_password_reset_token_cannot_be_used_as_access_token():
+    # Token-confusion guard: a reset token must NOT authenticate the API.
+    token = security.create_password_reset_token("user-1", "u@example.com")
+    with pytest.raises(jwt.InvalidAudienceError):
+        security.decode_access_token(token)
+
+
+def test_access_token_cannot_be_used_as_reset_token():
+    token = security.create_access_token({"sub": "user-1"})
+    with pytest.raises(jwt.PyJWTError):
+        security.decode_password_reset_token(token)
+
+
+def test_verification_token_cannot_be_used_as_reset_token():
+    # Cross-purpose guard: distinct audiences keep the two single-purpose tokens apart.
+    token = security.create_email_verification_token("user-1", "u@example.com")
+    with pytest.raises(jwt.PyJWTError):
+        security.decode_password_reset_token(token)
