@@ -151,6 +151,25 @@ class Settings(BaseSettings):
     # come out over-processed / "messy". `enable_enhancement=False` still forces "off".
     enhancement_level: str = "full"
 
+    # --- Empty-stem filtering (only return stems the track actually contains) ---
+    # A separation model emits every source it was trained on, so a solo-piano upload
+    # still produced a "drums" file full of bleed. With the gate on, a stem is written
+    # only when it clears BOTH floors below. Set False to restore the old fixed stem set.
+    stem_filter_enabled: bool = True
+    # Absolute floor: a stem never peaking above this is inaudible in any context.
+    stem_silence_peak_dbfs: float = -50.0
+    # Relative floor: the stem's loudest window vs. the mix's overall RMS. Level-independent,
+    # which the absolute floor is not. Raise toward -30 to prune more aggressively; lower
+    # toward -45 to keep more. Both floors are permissive by design — dropping a stem the
+    # user can hear is far worse than shipping one extra quiet file.
+    stem_silence_relative_rms_db: float = -38.0
+    # Window the relative measurement uses. Measuring the loudest window (not overall RMS)
+    # is what keeps an instrument that plays only in the bridge from being pruned.
+    stem_silence_window_seconds: float = 1.0
+    # Comma-separated stems that are never dropped, whatever the measurement says — an
+    # escape hatch for pinning a stem the product contract promises. Empty = gate them all.
+    stem_filter_always_keep: str = ""
+
     # --- Progress-write debounce (RCA-3) ---
     # Sample every poll_seconds, but only write on a label change, a jump >= min_delta,
     # or once min_interval_seconds has passed (liveness tick, so long stages don't look frozen).

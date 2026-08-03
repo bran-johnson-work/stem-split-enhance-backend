@@ -13,7 +13,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
+from app.engine import silence
 from app.engine.dsp import (
     enhance_stem,
     get_model_and_device,
@@ -35,6 +36,34 @@ MIN_REFERENCE_SAMPLES = 4096  # enough for a meaningful average spectrum
 ProgressFn = Callable[[float, str], None]
 
 
+def _gate_options(settings: Settings) -> dict | None:
+    """Kwargs for :func:`silence.select_present`, or None when the content gate is off."""
+    if not settings.stem_filter_enabled:
+        return None
+    return {
+        "peak_floor_dbfs": settings.stem_silence_peak_dbfs,
+        "relative_floor_db": settings.stem_silence_relative_rms_db,
+        "window_seconds": settings.stem_silence_window_seconds,
+        "always_keep": frozenset(
+            n.strip().lower() for n in settings.stem_filter_always_keep.split(",") if n.strip()
+        ),
+    }
+
+
+def _log_verdicts(verdicts: list[silence.StemVerdict]) -> None:
+    """Record why each stem was kept or dropped — the audit trail for a missing stem.
+
+    Logged at INFO for kept stems and WARNING for dropped ones: "where did my drums go"
+    is the one support question this feature creates, and it has to be answerable from
+    the worker log alone.
+    """
+    for v in verdicts:
+        if v.keep:
+            logger.info("silence.keep stem=%s %s", v.name, v.reason)
+        else:
+            logger.warning("silence.drop stem=%s %s", v.name, v.reason)
+
+
 @dataclass(frozen=True)
 class FinalizedStem:
     """One written stem WAV, ready for the worker to upload and record."""
@@ -50,11 +79,17 @@ def separate_all(
     on_step: ProgressFn | None = None,
     want_instruments: bool = True,
 ) -> tuple[dict[str, np.ndarray], int]:
-    """Separate one file into the full POC stem set as raw (channels, samples) float32 arrays.
+    """Separate one file into the stem set as raw (channels, samples) float32 arrays.
 
     htdemucs_ft gives vocals / drums / bass / other; htdemucs_6s adds guitar + piano (the
     2+ instruments); the drums stem is then DSP-split into kick / snare / hi-hats. Returns
     ({stem_name: array}, samplerate). on_step(progress_0_100, label) reports progress.
+
+    Stems the source track does not actually contain are dropped here rather than written
+    as near-silent files (see :mod:`app.engine.silence`), so the returned dict is a subset
+    of the catalogue whose size varies per track. The drum split is skipped entirely when
+    the drums stem itself is judged empty — its band-split products would be nothing but
+    filtered noise, and skipping saves the work.
     """
 
     def step(progress: float, label: str) -> None:
@@ -85,9 +120,25 @@ def separate_all(
             if six.get(name) is not None:
                 stems[name] = six[name]
 
+    # Drop the stems this track doesn't actually contain, before anything is enhanced or
+    # written. The mix's own level is the reference the relative floor is measured against.
+    gate = _gate_options(get_settings())
+    mix_rms = 0.0
+    if gate is not None:
+        step(60.0, "Checking stems for audio content")
+        mix_rms = silence.rms_dbfs(wav.detach().cpu().numpy())
+        stems, verdicts = silence.select_present(stems, sr, mix_rms, **gate)
+        _log_verdicts(verdicts)
+
     if "drums" in stems:
         step(64.0, "Splitting drums (kick / snare / hi-hats)")
-        stems.update(split_drums(stems["drums"], sr))
+        subs = split_drums(stems["drums"], sr)
+        if gate is not None:
+            # Gated independently of the parent: a kit with no cymbals yields a real
+            # kick and snare but an empty hi-hats band.
+            subs, sub_verdicts = silence.select_present(subs, sr, mix_rms, **gate)
+            _log_verdicts(sub_verdicts)
+        stems.update(subs)
 
     return stems, sr
 

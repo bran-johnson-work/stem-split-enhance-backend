@@ -48,10 +48,18 @@ Stems land at `audio-stems/{user_id}/{project_id}/stems/{stem}.wav`, so the exis
 
 ## Stems produced
 
-`vocals, drums, kick, snare, hihats, bass, guitar, piano, other` (9). `htdemucs_ft` gives
-vocals/drums/bass/other; `htdemucs_6s` adds guitar/piano; the drums stem is DSP band-split
-into kick/snare/hihats. Enhanced tonal stems have `is_enhanced=true`; the drum sub-stems are
-peak-normalized only (`is_enhanced=false`).
+Catalogue: `vocals, drums, kick, snare, hihats, bass, guitar, piano, other`. `htdemucs_ft`
+gives vocals/drums/bass/other; `htdemucs_6s` adds guitar/piano; the drums stem is DSP
+band-split into kick/snare/hihats. Enhanced tonal stems have `is_enhanced=true`; the drum
+sub-stems are peak-normalized only (`is_enhanced=false`).
+
+**The number of stems varies per track.** A separation model emits every source it was
+trained on, so a solo-piano upload used to come back with a `drums.wav` full of bleed.
+`app/engine/silence.py` measures each stem against the mix and drops the ones the track
+doesn't actually contain, before enhancement or writing; the drum split is skipped
+entirely when the drums stem itself is empty. Clients must render the returned list rather
+than assume 9 files. `STEM_FILTER_ENABLED=false` restores the old fixed set — see
+[empty-stem-filter.md](empty-stem-filter.md) for the thresholds and the tuning knobs.
 
 ## Running the worker
 
@@ -91,6 +99,9 @@ more worker instances — `FOR UPDATE SKIP LOCKED` guarantees each job goes to e
   on `/process`; add it as an optional request field when needed.
 - Raw (pre-enhancement) A/B stems from the POC are not stored (one deliverable per stem) —
   the `is_enhanced` flag and the pipeline already support adding them if the UI wants A/B.
+- Separation quality, a v2 model migration and the v1↔v2 A/B comparison design are worked
+  through in [stem-quality-v2.md](stem-quality-v2.md). Note that `DEMUCS_SHIFTS` still
+  defaults to the POC value of 1 with test-time augmentation effectively off.
 - The queue is polling-based (`WORKER_POLL_INTERVAL_SECONDS`). For lower latency, switch to
   `LISTEN/NOTIFY` or Supabase Queues (`pgmq`) without changing the claim semantics.
 ```
