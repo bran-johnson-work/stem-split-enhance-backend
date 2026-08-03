@@ -72,17 +72,27 @@ async def _create_or_promote(
     return user, True
 
 
-async def main(email: str, password: str | None, name: str | None, promote: bool) -> None:
+async def main(
+    email: str, password: str | None, name: str | None, promote: bool, force: bool
+) -> None:
     settings = get_settings()
-    if not settings.is_local:
+    if not settings.is_local and not force:
         # Guardrail: this bypasses registration/auth entirely. Refuse outside local
         # unless explicitly forced, so it can't silently mint an admin in prod.
         print(
             f"[!] APP_ENV is {settings.app_env!r}, not 'local'. Refusing to create an "
-            "admin against a non-local database. Set APP_ENV=local (or run this only "
-            "against your dev DB) if that's really what you want."
+            "admin against a non-local database. Re-run with --force if you really mean "
+            "to seed this admin against the production database this env points at."
         )
         return
+    if not settings.is_local and force:
+        # Loud confirmation of what prod DB we're about to write to, so --force can't
+        # be pasted blindly into the wrong environment.
+        target = settings.postgres_host or "(legacy DATABASE_URL)"
+        print(
+            f"[!] --force: seeding ADMIN against NON-LOCAL env {settings.app_env!r} "
+            f"(db host: {target})."
+        )
 
     if _validate_email(email) is None:
         # Matches the API's own EmailStr rules — reserved domains like ".local",
@@ -129,5 +139,10 @@ if __name__ == "__main__":
         action="store_true",
         help="promote an existing account without changing its password",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="allow running against a non-local database (production). Off by default.",
+    )
     args = parser.parse_args()
-    asyncio.run(main(args.email, args.password, args.name, args.promote))
+    asyncio.run(main(args.email, args.password, args.name, args.promote, args.force))
