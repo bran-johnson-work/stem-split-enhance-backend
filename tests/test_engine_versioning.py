@@ -16,6 +16,7 @@ pytest.importorskip("numpy")
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+import yaml  # noqa: E402
 
 SR = 44100
 
@@ -269,3 +270,71 @@ def test_engine_config_snapshot_records_version_specific_dials():
     assert "recompute_other" in v2
     # Without the thresholds recorded, a stem set from an old run is uninterpretable.
     assert "stem_filter" in v2
+
+
+# --- config YAML parsing -----------------------------------------------------------
+# The published KimberleyJensen vocals config carries `!!python/tuple`, which plain
+# yaml.safe_load refuses ("could not determine a constructor"). That took down v2 in
+# production: prewarm logged roformer_failed and the worker went on claiming v2 jobs.
+
+_UPSTREAM_SHAPE = """
+audio:
+  chunk_size: 352800
+  sample_rate: 44100
+model:
+  stft_n_fft: 2048
+  multi_stft_resolutions_window_sizes: !!python/tuple
+  - 4096
+  - 2048
+  - 1024
+  - 512
+  - 256
+training:
+  instruments:
+  - vocals
+  - other
+"""
+
+
+def test_load_config_accepts_python_tuple_tag(tmp_path):
+    from app.engine import roformer
+
+    path = tmp_path / "cfg.yaml"
+    path.write_text(_UPSTREAM_SHAPE, encoding="utf-8")
+
+    cfg = roformer._load_config(path)
+    assert cfg["audio"]["sample_rate"] == 44100
+    assert cfg["model"]["multi_stft_resolutions_window_sizes"] == (4096, 2048, 1024, 512, 256)
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "!!python/object/apply:os.system",
+        "!!python/name:os.system",
+        "!!python/object:os.System",
+    ],
+)
+def test_load_config_still_rejects_other_python_tags(tmp_path, tag):
+    """The tuple constructor must not widen into full unsafe loading.
+
+    This config is downloaded from the internet at runtime, so anything that can
+    instantiate arbitrary Python is a remote code execution path.
+    """
+    from app.engine import roformer
+
+    path = tmp_path / "cfg.yaml"
+    path.write_text(f"audio:\n  x: {tag} ['echo hi']\nmodel: {{}}\n", encoding="utf-8")
+
+    with pytest.raises(yaml.YAMLError):
+        roformer._load_config(path)
+
+
+def test_load_config_rejects_config_missing_required_sections(tmp_path):
+    from app.engine import roformer
+
+    path = tmp_path / "cfg.yaml"
+    path.write_text("audio:\n  sample_rate: 44100\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no 'model' section"):
+        roformer._load_config(path)

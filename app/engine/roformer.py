@@ -47,6 +47,28 @@ _model: tuple[object, str, dict] | None = None
 _load_lock = threading.Lock()
 
 
+class _ConfigLoader(yaml.SafeLoader):
+    """SafeLoader that also understands ``!!python/tuple``.
+
+    The upstream configs are dumped by omegaconf/PyYAML with Python tags — the
+    KimberleyJensen vocals config carries ``multi_stft_resolutions_window_sizes:
+    !!python/tuple``, which plain ``safe_load`` refuses with "could not determine a
+    constructor", failing the whole parse over a *training*-loss parameter inference
+    never reads.
+
+    Deliberately not ``yaml.unsafe_load``/``full_load``: this file is downloaded from
+    the internet at runtime, so it must never be able to instantiate arbitrary Python.
+    Teaching SafeLoader the one tag keeps every other tag rejected.
+    """
+
+
+def _construct_python_tuple(loader: yaml.Loader, node: yaml.Node) -> tuple:
+    return tuple(loader.construct_sequence(node))
+
+
+_ConfigLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_python_tuple)
+
+
 def _load_config(path: Path) -> dict:
     """Parse the model config YAML into plain dicts.
 
@@ -54,7 +76,7 @@ def _load_config(path: Path) -> dict:
     ``yaml`` avoids adding a dependency for attribute access we don't need.
     """
     with path.open("r", encoding="utf-8") as fh:
-        cfg = yaml.safe_load(fh)
+        cfg = yaml.load(fh, Loader=_ConfigLoader)  # noqa: S506 - SafeLoader subclass
     for section in ("audio", "model"):
         if section not in cfg:
             raise RuntimeError(
