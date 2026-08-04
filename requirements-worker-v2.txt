@@ -1,0 +1,16 @@
+
+# v2 worker: everything the v1 worker has, plus the Mel-Band RoFormer stack.
+#
+# Kept as a separate file (rather than extras in requirements-worker.txt) so the v1
+# image stays exactly as it is today. The v2 rollout must not be able to change what
+# the currently-deployed v1 fleet installs.
+-r requirements-worker.txt
+
+# MelBandRoformer / BSRoformer architectures (lucidrains, MIT). Pinned to a minor range:
+# these classes take their hyperparameters from the checkpoint's config YAML, and an
+# architecture change upstream would silently mismatch the pinned weights.
+bs-roformer>=1.2,<1.3
+
+# Reads the checkpoint's config YAML. Present transitively via demucs today; declared
+# explicitly because app/engine/roformer.py imports it directly.
+PyYAML>=6.0,<7.0

@@ -1,0 +1,85 @@
+# Two worker fleets against one Postgres queue.
+#
+#   worker-v1  — HT-Demucs, exactly what is deployed today. Claims engine_version = v1.
+#   worker-v2  — Mel-Band RoFormer vocals + HT-Demucs rhythm. Claims engine_version = v2.
+#
+# They are told apart ONLY by WORKER_ENGINE_VERSIONS. Nothing else routes work: both poll
+# the same `processing_jobs` table with FOR UPDATE SKIP LOCKED, filtered on that list. So a
+# v1 container can never pick up a v2 job (it has no RoFormer weights and would run the
+# wrong model while labelling the result "v2"), and scaling one fleet is independent of the
+# other.
+#
+# You were running 4 workers of one image. The split below keeps that total at 4 —
+# 2 v1 + 2 v2 — which is the right starting point for an A/B where every project is
+# rendered twice. Adjust with WORKER_V1_REPLICAS / WORKER_V2_REPLICAS.
+#
+# Usage:
+#   docker compose -f docker-compose.workers.yml build
+#   docker compose -f docker-compose.workers.yml up -d
+#   docker compose -f docker-compose.workers.yml logs -f worker-v2
+#   docker compose -f docker-compose.workers.yml up -d --scale worker-v2=4
+#
+# For GPU hosts see the commented `deploy.resources` block and set
+# TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 plus WORKER_DEVICE=cuda.
+
+x-worker-common: &worker-common
+  restart: unless-stopped
+  env_file: [.env]
+  volumes:
+    # The weights cache. Shared by both fleets on purpose: they both use the demucs
+    # checkpoints, so one copy serves everyone and a restart never re-downloads.
+    # Concurrent first-boots are safe — app/engine/weights.py writes to a temp file and
+    # atomically renames.
+    - stem_weights:/cache/torch
+  # A separation job holds a multi-hundred-MB tensor per stem plus the model. Give the
+  # container a real ceiling so an OOM kills one worker, not the host — the reaper
+  # requeues whatever it was holding.
+  mem_limit: ${WORKER_MEM_LIMIT:-8g}
+
+services:
+  worker-v1:
+    <<: *worker-common
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: stem-worker:v1
+    environment:
+      # The correctness boundary: this image has no RoFormer stack, so it must claim v1
+      # only. Do not widen this to "v1,v2".
+      WORKER_ENGINE_VERSIONS: v1
+      WORKER_DEVICE: ${WORKER_DEVICE:-auto}
+    deploy:
+      replicas: ${WORKER_V1_REPLICAS:-2}
+
+  worker-v2:
+    <<: *worker-common
+    build:
+      context: .
+      dockerfile: Dockerfile.worker.v2
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: stem-worker:v2
+    environment:
+      WORKER_ENGINE_VERSIONS: v2
+      WORKER_DEVICE: ${WORKER_DEVICE:-auto}
+      # RoFormer runs ~2x the wall-clock of v1, so give a stalled v2 job more rope before
+      # the reaper calls it dead. Too tight here and the reaper requeues jobs that are
+      # merely slow, which loops forever and burns GPU.
+      JOB_STALE_TIMEOUT_SECONDS: ${V2_JOB_STALE_TIMEOUT_SECONDS:-300}
+      # VRAM/RAM dial: drop to 1 on CUDA OOM, raise on a bigger card.
+      V2_BATCH_SIZE: ${V2_BATCH_SIZE:-4}
+      V2_OVERLAP: ${V2_OVERLAP:-2}
+    deploy:
+      replicas: ${WORKER_V2_REPLICAS:-2}
+      # --- GPU: uncomment, and build with the cu126/cu128 torch index ---
+      # resources:
+      #   reservations:
+      #     devices:
+      #       - driver: nvidia
+      #         count: 1
+      #         capabilities: [gpu]
+
+volumes:
+  stem_weights:

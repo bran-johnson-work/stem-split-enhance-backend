@@ -3,6 +3,18 @@
 Research current as of **2026-08-03**. Leaderboard numbers move weekly — re-check before
 committing spend.
 
+> **Implementation status.** The v2 engine and the two-fleet deployment described in §4 are
+> **built**: `app/engine/roformer.py`, `app/engine/weights.py`, the version dispatch in
+> `app/engine/pipeline.py`, `engine_version`/`engine_config` on `processing_jobs` (migration
+> `b8c2e4f6a1d3`), version-filtered claiming, A/B dual-run, `GET /projects/{id}/stems/compare`,
+> `Dockerfile.worker.v2`, and `docker-compose.workers.yml`.
+> **Operational runbook: [deploy-v1-v2-workers.md](deploy-v1-v2-workers.md).**
+>
+> v2 ships **Mel-Band RoFormer**, not the 4-model ensemble and not BS Roformer 124 bands —
+> see finding (b) below for why the latter cannot be self-hosted at all.
+> Phase 0 (§3) is **not** done: `DEMUCS_SHIFTS` is still 1 and `ENHANCEMENT_LEVEL` is still
+> `full`. Those are free config wins and should land regardless of v2.
+
 ---
 
 ## 1. Audit of what is deployed today (v1)

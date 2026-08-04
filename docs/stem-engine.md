@@ -99,9 +99,15 @@ more worker instances — `FOR UPDATE SKIP LOCKED` guarantees each job goes to e
   on `/process`; add it as an optional request field when needed.
 - Raw (pre-enhancement) A/B stems from the POC are not stored (one deliverable per stem) —
   the `is_enhanced` flag and the pipeline already support adding them if the UI wants A/B.
-- Separation quality, a v2 model migration and the v1↔v2 A/B comparison design are worked
-  through in [stem-quality-v2.md](stem-quality-v2.md). Note that `DEMUCS_SHIFTS` still
-  defaults to the POC value of 1 with test-time augmentation effectively off.
+- Separation quality and the model research behind v2 are in
+  [stem-quality-v2.md](stem-quality-v2.md). Note that `DEMUCS_SHIFTS` still defaults to the
+  POC value of 1, with test-time augmentation effectively off.
+- **Two engine versions now share this queue.** `v1` is the HT-Demucs stack described above;
+  `v2` swaps in Mel-Band RoFormer for vocals (`app/engine/roformer.py`) and keeps Demucs for
+  the rhythm section. Jobs carry `engine_version`, and each worker claims only the versions
+  in its own `WORKER_ENGINE_VERSIONS` — so a v1 container and a v2 container run as separate
+  services against one `processing_jobs` table. Deployment, rollout and rollback:
+  [deploy-v1-v2-workers.md](deploy-v1-v2-workers.md).
 - The queue is polling-based (`WORKER_POLL_INTERVAL_SECONDS`). For lower latency, switch to
   `LISTEN/NOTIFY` or Supabase Queues (`pgmq`) without changing the claim semantics.
 ```

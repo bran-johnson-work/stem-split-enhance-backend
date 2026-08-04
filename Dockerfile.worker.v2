@@ -1,0 +1,82 @@
+
+# v2 separation worker: Mel-Band RoFormer vocals + HT-Demucs rhythm section.
+#
+# Deliberately a separate Dockerfile from Dockerfile.worker rather than a build ARG on it:
+# the v1 fleet is in production, and a v2 dependency change must not be able to alter the
+# image v1 builds from. The two run side by side as separate services, told apart at
+# runtime by WORKER_ENGINE_VERSIONS (v1 -> "v1", this one -> "v2").
+#
+# Default = CPU wheels. For an AWS GPU host, override the torch index to match the driver:
+#   docker build -f Dockerfile.worker.v2 \
+#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+#     -t stem-worker-v2:gpu .
+#   docker run --gpus all -e WORKER_DEVICE=cuda -e WORKER_ENGINE_VERSIONS=v2 ... stem-worker-v2:gpu
+# torch 2.11 ships on cu126 / cu128 — pick the index matching the host driver.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+
+# ---- Stage 1: builder — resolve deps into a self-contained venv ----
+FROM ${PYTHON_IMAGE} AS builder
+ARG TORCH_INDEX_URL
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# torch/torchaudio FIRST from the selected index so the CPU-vs-CUDA variant is pinned
+# before the rest of the tree resolves torch (bs-roformer also depends on it).
+RUN pip install --index-url ${TORCH_INDEX_URL} "torch>=2.11,<2.12" "torchaudio>=2.11,<2.12"
+
+COPY requirements.txt requirements-worker.txt requirements-worker-v2.txt ./
+RUN pip install -r requirements-worker-v2.txt
+
+# ---- Stage 2: runtime — slim final image, no build tooling / pip cache ----
+FROM ${PYTHON_IMAGE} AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TORCH_HOME=/cache/torch \
+    PATH="/opt/venv/bin:$PATH" \
+    WORKER_ENGINE_VERSIONS=v2
+
+# libsndfile1: audio decoding for soundfile. ffmpeg is optional (only for exotic
+# formats like M4A/WMA that libsndfile can't read) — add it if you need them.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Same worker-only import closure as Dockerfile.worker — app/api, app/main.py and
+# app/services are NOT in the worker's import graph. app/engine now also contains
+# roformer.py + weights.py, which the existing `COPY app/engine` already covers.
+COPY app/core ./app/core
+COPY app/models ./app/models
+COPY app/repositories ./app/repositories
+COPY app/schemas ./app/schemas
+COPY app/engine ./app/engine
+COPY app/worker ./app/worker
+COPY scripts ./scripts
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
+
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /cache/torch/v2 \
+    && chown -R appuser:appuser /cache /app
+USER appuser
+
+# Weights download here on first run: ~400 MB demucs (htdemucs_ft + 6s) plus the
+# Mel-Band RoFormer checkpoint. Mount a volume or they re-download on every restart.
+# Prefer baking them in for a fleet that scales — see docs/stem-quality-v2.md:
+#   RUN python -m scripts.fetch_v2_weights
+VOLUME ["/cache/torch"]
+
+CMD ["python", "-m", "app.worker"]

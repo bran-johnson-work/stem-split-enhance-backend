@@ -170,6 +170,57 @@ class Settings(BaseSettings):
     # escape hatch for pinning a stem the product contract promises. Empty = gate them all.
     stem_filter_always_keep: str = ""
 
+    # --- Engine versioning / A-B (see docs/stem-quality-v2.md) ---
+    # v1 = HT-Demucs only (the fleet deployed today). v2 = Mel-Band RoFormer vocals +
+    # Demucs for the remaining stems.
+    #
+    # WORKER_ENGINE_VERSIONS is the deployment knob: the versions THIS container claims
+    # from the shared queue. The v1 service sets "v1", the v2 service sets "v2". A v2 job
+    # claimed by a v1 image would silently run the wrong model and mislabel the output,
+    # so this is a correctness boundary. Blank claims anything (single-fleet deploys).
+    worker_engine_versions: str = "v1"
+    # Which version a newly enqueued job is stamped with.
+    engine_version_default: str = "v1"
+    # Dual-run: enqueue BOTH a v1 and a v2 job per request so the UI can compare them.
+    # Costs two full renders — gate it with the percentage/allowlist below.
+    engine_ab_enabled: bool = False
+    # Percentage of projects that get dual-run, bucketed on a stable hash of the project
+    # id (never per-request random, or a user's project would flip version on retry).
+    engine_ab_percent: int = 0
+    # User ids that always dual-run regardless of the percentage (the internal team).
+    engine_ab_user_allowlist: str = ""
+
+    # --- v2 engine: Mel-Band RoFormer ---
+    # NOTE: the top-of-leaderboard "BS Roformer 124 bands (2026.07)" has NO public
+    # weights — it is MVSep-hosted only and cannot be self-hosted at any price. This is
+    # the best *downloadable* vocal model (MIT weights, ~10.98 dB vocals SDR).
+    v2_vocals_ckpt_url: str = (
+        "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt"
+    )
+    v2_vocals_config_url: str = (
+        "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/"
+        "configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml"
+    )
+    # Pin this once you have fetched the checkpoint (`python -m scripts.fetch_v2_weights`
+    # prints it). Blank = the download is NOT integrity-checked, which is logged as a
+    # warning on every load: a community checkpoint changing under you is a silent
+    # quality regression with no diff to review.
+    v2_vocals_ckpt_sha256: str = ""
+    # Where v2 checkpoints are cached. Defaults under TORCH_HOME so the existing
+    # /cache/torch volume persists them alongside the demucs weights.
+    v2_weights_dir: str = ""
+    # Inference dials. chunk_size comes from the model config (352800 = 8 s @ 44.1 kHz).
+    # overlap = how many chunk-strides cover each sample; higher is smoother at the seams
+    # and linearly slower. 2 is the config default, 4 is a good prod value.
+    v2_overlap: int = 2
+    # Chunks per forward pass. The main VRAM dial: raise it to use a bigger card, drop it
+    # to 1 if you hit CUDA OOM.
+    v2_batch_size: int = 4
+    # Rebuild "other" as (mix - roformer_vocals - demucs_drums - demucs_bass) instead of
+    # taking Demucs' own "other". The RoFormer vocal is much cleaner than Demucs', so
+    # subtracting it removes the vocal bleed that made "other" the worst v1 stem.
+    v2_recompute_other: bool = True
+
     # --- Progress-write debounce (RCA-3) ---
     # Sample every poll_seconds, but only write on a label change, a jump >= min_delta,
     # or once min_interval_seconds has passed (liveness tick, so long stages don't look frozen).
@@ -211,6 +262,21 @@ class Settings(BaseSettings):
     @property
     def allowed_image_content_type_set(self) -> set[str]:
         return {t.strip().lower() for t in self.allowed_image_content_types.split(",") if t.strip()}
+
+    @property
+    def worker_engine_version_list(self) -> list[str]:
+        """Engine versions this worker claims. Empty list = claim any version."""
+        return [v.strip().lower() for v in self.worker_engine_versions.split(",") if v.strip()]
+
+    @property
+    def ab_user_allowlist_set(self) -> set[str]:
+        return {u.strip().lower() for u in self.engine_ab_user_allowlist.split(",") if u.strip()}
+
+    @property
+    def stem_filter_always_keep_set(self) -> frozenset[str]:
+        return frozenset(
+            n.strip().lower() for n in self.stem_filter_always_keep.split(",") if n.strip()
+        )
 
     @property
     def has_postgres_components(self) -> bool:

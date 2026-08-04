@@ -14,7 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import storage
 from app.core.config import Settings, get_settings
 from app.core.database import AsyncSessionLocal
-from app.engine.pipeline import FinalizedStem, separate_and_finalize
+from app.engine.pipeline import (
+    FinalizedStem,
+    engine_config_snapshot,
+    separate_and_finalize,
+)
 from app.models.processing_job import JobStatus
 from app.models.project import ProjectStatus
 from app.repositories.output_file_repository import output_file_repository
@@ -179,6 +183,10 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
         input_path.write_bytes(data)
 
         # 3. Run the engine off the event loop; relay progress into the DB while it runs.
+        #    The version comes from the job row, not from this container's config: the
+        #    claim filter already guaranteed this image can run it, and honouring the row
+        #    is what keeps the recorded version and the actual models in agreement.
+        engine_version = (job.engine_version or "v1").strip().lower()
         out_dir = scratch / "stems"
         reporter = ProgressReporter()
         task = asyncio.create_task(
@@ -189,6 +197,7 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
                 reporter,
                 want_instruments=settings.enable_instruments,
                 want_enhancement=settings.enable_enhancement,
+                engine_version=engine_version,
             )
         )
         while not task.done():
@@ -199,7 +208,13 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
         finalized, _sr = await task
 
         # 4. Persist each stem (S3 bucket, or a local folder if configured) and record it.
+        #    v1 keeps the historical un-versioned prefix so already-delivered stems and
+        #    their signed URLs stay valid; only newer versions get a segment of their own.
+        #    Both stay under {user}/{project}/, so the delete_project prefix purge still
+        #    reaches them.
         prefix = f"{project.user_id}/{project.id}/stems"
+        if engine_version != "v1":
+            prefix = f"{prefix}/{engine_version}"
         for idx, stem in enumerate(finalized):
             await _emit_progress(
                 db,
@@ -220,13 +235,19 @@ async def process_job(db: AsyncSession, job_id: uuid.UUID) -> None:
             job.progress = 100.0
             job.current_step = "Done"
             job.completed_at = datetime.now(timezone.utc)
+            # Stamp what actually ran, so an A/B comparison is still interpretable once
+            # the settings have moved on.
+            job.engine_config = engine_config_snapshot(engine_version)
             db.add(job)
         project = await project_repository.get(db, project.id)
         if project is not None:
             project.status = ProjectStatus.COMPLETED
             db.add(project)
         await db.commit()
-        logger.info("worker.job_completed id=%s stems=%d", job_id, len(finalized))
+        logger.info(
+            "worker.job_completed id=%s version=%s stems=%d",
+            job_id, engine_version, len(finalized),
+        )
     except Exception as exc:  # worker boundary: record on the job, keep the loop alive
         logger.exception("worker.job_failed id=%s", job_id)
         await db.rollback()

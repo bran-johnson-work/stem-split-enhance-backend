@@ -44,9 +44,7 @@ def _gate_options(settings: Settings) -> dict | None:
         "peak_floor_dbfs": settings.stem_silence_peak_dbfs,
         "relative_floor_db": settings.stem_silence_relative_rms_db,
         "window_seconds": settings.stem_silence_window_seconds,
-        "always_keep": frozenset(
-            n.strip().lower() for n in settings.stem_filter_always_keep.split(",") if n.strip()
-        ),
+        "always_keep": settings.stem_filter_always_keep_set,
     }
 
 
@@ -74,28 +72,11 @@ class FinalizedStem:
     file_size_bytes: int
 
 
-def separate_all(
-    input_path: Path,
-    on_step: ProgressFn | None = None,
-    want_instruments: bool = True,
-) -> tuple[dict[str, np.ndarray], int]:
-    """Separate one file into the stem set as raw (channels, samples) float32 arrays.
-
-    htdemucs_ft gives vocals / drums / bass / other; htdemucs_6s adds guitar + piano (the
-    2+ instruments); the drums stem is then DSP-split into kick / snare / hi-hats. Returns
-    ({stem_name: array}, samplerate). on_step(progress_0_100, label) reports progress.
-
-    Stems the source track does not actually contain are dropped here rather than written
-    as near-silent files (see :mod:`app.engine.silence`), so the returned dict is a subset
-    of the catalogue whose size varies per track. The drum split is skipped entirely when
-    the drums stem itself is judged empty — its band-split products would be nothing but
-    filtered noise, and skipping saves the work.
-    """
-
-    def step(progress: float, label: str) -> None:
-        if on_step:
-            on_step(progress, label)
-
+def _separate_v1(
+    input_path: Path, step: ProgressFn, want_instruments: bool
+) -> tuple[dict[str, np.ndarray], int, "np.ndarray"]:
+    """v1: HT-Demucs only. htdemucs_ft for vocals/drums/bass/other, htdemucs_6s for
+    guitar/piano. Returns (stems, samplerate, decoded_mix)."""
     step(5.0, "Separating stems (HT-Demucs ft)")
     model, device = get_model_and_device()  # htdemucs_ft
     sr = model.samplerate
@@ -120,18 +101,132 @@ def separate_all(
             if six.get(name) is not None:
                 stems[name] = six[name]
 
+    return stems, sr, wav.detach().cpu().numpy()
+
+
+def _separate_v2(
+    input_path: Path, step: ProgressFn, want_instruments: bool
+) -> tuple[dict[str, np.ndarray], int, "np.ndarray"]:
+    """v2: Mel-Band RoFormer vocals + HT-Demucs for everything else.
+
+    The vocal model is where nearly all the quality gain is (~10.98 dB vs ~8.2-8.9 dB
+    SDR), and no open model beats Demucs on bass/drums by a margin worth a second heavy
+    pass — so Demucs keeps those. See docs/stem-quality-v2.md for why this and not the
+    4-model ensemble.
+
+    With ``V2_RECOMPUTE_OTHER`` on, ``other`` is rebuilt as
+    ``mix - roformer_vocals - demucs_drums - demucs_bass`` rather than taken from Demucs.
+    Demucs' own ``other`` carries its vocal-separation error as bleed, which is what made
+    it the worst v1 stem; subtracting the much cleaner RoFormer vocal removes it.
+    """
+    from app.engine import roformer
+
+    step(4.0, "Separating vocals (Mel-Band RoFormer)")
+    rmodel, rdevice, rcfg = roformer.get_vocals_model()
+    sr = int(rcfg["audio"]["sample_rate"])
+    channels = int(rcfg["audio"].get("num_channels", 2))
+    wav = load_audio(input_path, sr, channels)
+
+    def on_chunk(done: int, total: int) -> None:
+        step(6.0 + done / max(1, total) * 34.0, f"Separating vocals ({done}/{total})")
+
+    vocals = roformer.separate_vocals(rmodel, rdevice, rcfg, wav, on_progress=on_chunk)
+    stems: dict[str, np.ndarray] = {"vocals": vocals}
+
+    step(42.0, "Separating rhythm section (HT-Demucs ft)")
+    dmodel, ddevice = get_model_and_device()
+    # Demucs runs at 44.1 kHz stereo, the same as the RoFormer config, so the decoded mix
+    # is reused. If a future checkpoint changes either, re-decode rather than resample.
+    if dmodel.samplerate == sr and dmodel.audio_channels == channels:
+        dwav = wav
+    else:
+        dwav = load_audio(input_path, dmodel.samplerate, dmodel.audio_channels)
+
+    def on_ft_done(done: int, total: int) -> None:
+        step(44.0 + done / total * 20.0, f"Separating rhythm section ({done}/{total} models)")
+
+    base = separate_sources(dmodel, ddevice, dwav, on_ft_done)
+    for name in ("drums", "bass"):
+        if base.get(name) is not None:
+            stems[name] = base[name]
+
+    mix = wav.detach().cpu().numpy()
+    if get_settings().v2_recompute_other:
+        residual = mix.copy()
+        for name in ("vocals", "drums", "bass"):
+            part = stems.get(name)
+            if part is not None:
+                n = min(residual.shape[-1], part.shape[-1])
+                residual[..., :n] -= part[..., :n]
+        stems["other"] = residual.astype(np.float32)
+    elif base.get("other") is not None:
+        stems["other"] = base["other"]
+
+    if want_instruments:
+        step(66.0, "Separating instruments (HT-Demucs 6s)")
+        imodel, idevice = get_model_and_device(get_settings().instruments_model)
+        same = imodel.samplerate == sr and imodel.audio_channels == channels
+        iwav = wav if same else load_audio(input_path, imodel.samplerate, imodel.audio_channels)
+        six = separate_sources(imodel, idevice, iwav)
+        for name in ("guitar", "piano"):
+            if six.get(name) is not None:
+                stems[name] = six[name]
+
+    return stems, sr, mix
+
+
+#: Engine versions this build can run. ``separate_all`` rejects anything else rather than
+#: silently falling back to v1 and mislabelling the output as the version that was asked for.
+SEPARATORS = {"v1": _separate_v1, "v2": _separate_v2}
+
+
+def separate_all(
+    input_path: Path,
+    on_step: ProgressFn | None = None,
+    want_instruments: bool = True,
+    engine_version: str = "v1",
+) -> tuple[dict[str, np.ndarray], int]:
+    """Separate one file into the stem set as raw (channels, samples) float32 arrays.
+
+    ``engine_version`` selects the model stack: ``v1`` = HT-Demucs (as deployed today),
+    ``v2`` = Mel-Band RoFormer vocals + HT-Demucs rhythm section. Returns
+    ({stem_name: array}, samplerate). on_step(progress_0_100, label) reports progress.
+
+    Everything after separation is shared by both versions: the content gate, the drum
+    split, enhancement and writing. Stems the source track does not actually contain are
+    dropped here rather than written as near-silent files (see :mod:`app.engine.silence`),
+    so the returned dict is a subset of the catalogue whose size varies per track. The drum
+    split is skipped entirely when the drums stem itself is judged empty — its band-split
+    products would be nothing but filtered noise, and skipping saves the work.
+    """
+
+    def step(progress: float, label: str) -> None:
+        if on_step:
+            on_step(progress, label)
+
+    version = (engine_version or "v1").strip().lower()
+    separator = SEPARATORS.get(version)
+    if separator is None:
+        raise RuntimeError(
+            f"Unknown engine_version {engine_version!r}; this build supports "
+            f"{sorted(SEPARATORS)}. A job stamped with a version this image cannot run "
+            "means WORKER_ENGINE_VERSIONS is letting it claim the wrong work."
+        )
+
+    stems, sr, mix = separator(input_path, step, want_instruments)
+
     # Drop the stems this track doesn't actually contain, before anything is enhanced or
     # written. The mix's own level is the reference the relative floor is measured against.
     gate = _gate_options(get_settings())
     mix_rms = 0.0
     if gate is not None:
-        step(60.0, "Checking stems for audio content")
-        mix_rms = silence.rms_dbfs(wav.detach().cpu().numpy())
+        step(72.0, "Checking stems for audio content")
+        mix_rms = silence.rms_dbfs(mix)
         stems, verdicts = silence.select_present(stems, sr, mix_rms, **gate)
         _log_verdicts(verdicts)
 
     if "drums" in stems:
-        step(64.0, "Splitting drums (kick / snare / hi-hats)")
+        step(74.0, "Splitting drums (kick / snare / hi-hats)")
         subs = split_drums(stems["drums"], sr)
         if gate is not None:
             # Gated independently of the parent: a kit with no cymbals yields a real
@@ -184,6 +279,7 @@ def separate_and_finalize(
     want_instruments: bool = True,
     want_enhancement: bool = True,
     ref_window: tuple[float, float] | None = None,
+    engine_version: str = "v1",
 ) -> tuple[list[FinalizedStem], int]:
     """Full pipeline for one file: separate -> enhance -> write stem WAVs into ``out_dir``.
 
@@ -191,6 +287,7 @@ def separate_and_finalize(
     (``{name}.wav``); the drum sub-stems and — when ``want_enhancement`` is off — every stem
     are delivered at their natural separated level. ``ref_window`` (start_s, end_s) enables
     the reference-guided matching against a clean section of the same track.
+    ``engine_version`` picks the model stack (see :func:`separate_all`).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,7 +303,12 @@ def separate_and_finalize(
         if on_step:
             on_step(progress, label)
 
-    raw_stems, sr = separate_all(input_path, on_step=on_step, want_instruments=want_instruments)
+    raw_stems, sr = separate_all(
+        input_path,
+        on_step=on_step,
+        want_instruments=want_instruments,
+        engine_version=engine_version,
+    )
 
     ref_s = ref_e = 0
     if ref_window is not None:
@@ -225,7 +327,7 @@ def separate_and_finalize(
                 reference = stem[..., s:e]
 
         label = f"Enhancing {name}" + (" (reference-guided)" if reference is not None else "")
-        step(66.0 + idx / len(present) * 32.0, label)
+        step(78.0 + idx / len(present) * 20.0, label)
 
         out, is_enhanced = finalize_stem(
             name, stem, sr, reference=reference, want_enhancement=want_enhancement, level=level
@@ -241,5 +343,41 @@ def separate_and_finalize(
             )
         )
 
-    logger.info("pipeline.done stems=%s sr=%d", [f.stem_name for f in finalized], sr)
+    logger.info(
+        "pipeline.done version=%s stems=%s sr=%d",
+        engine_version, [f.stem_name for f in finalized], sr,
+    )
     return finalized, sr
+
+
+def engine_config_snapshot(engine_version: str) -> dict:
+    """The settings this run used, for ``processing_jobs.engine_config``.
+
+    Recorded so an A/B result stays interpretable: a v2 stem rendered at overlap 2 is not
+    the same artifact as one at overlap 4, and without this there is no way to tell them
+    apart after the fact.
+    """
+    s = get_settings()
+    snapshot: dict = {
+        "engine_version": engine_version,
+        "enhancement_level": s.enhancement_level if s.enable_enhancement else "off",
+        "instruments": s.enable_instruments,
+        "stem_filter": {
+            "enabled": s.stem_filter_enabled,
+            "peak_dbfs": s.stem_silence_peak_dbfs,
+            "relative_db": s.stem_silence_relative_rms_db,
+            "window_s": s.stem_silence_window_seconds,
+        },
+    }
+    if engine_version == "v2":
+        snapshot["vocals_model"] = "mel_band_roformer"
+        snapshot["vocals_ckpt_sha256"] = s.v2_vocals_ckpt_sha256 or None
+        snapshot["overlap"] = s.v2_overlap
+        snapshot["batch_size"] = s.v2_batch_size
+        snapshot["recompute_other"] = s.v2_recompute_other
+        snapshot["rhythm_model"] = s.demucs_model
+    else:
+        snapshot["model"] = s.demucs_model
+        snapshot["shifts"] = s.demucs_shifts
+        snapshot["overlap"] = s.demucs_overlap
+    return snapshot
