@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--reload", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "../frontend"],
+      "port": 3000
+    },
+    {
+      "name": "restoration",
+      "runtimeExecutable": "../separate-steam-and-enhance-audio/.venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "api.main:app", "--port", "8100"],
+      "port": 8100
+    }
+  ]
+}

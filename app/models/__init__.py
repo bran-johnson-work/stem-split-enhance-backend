@@ -6,6 +6,7 @@ from app.models.processing_job import JobStatus, ProcessingJob
 from app.models.project import Project, ProjectStatus
 from app.models.project_file import ProjectFile
 from app.models.refresh_token import RefreshToken
+from app.models.restoration_job import RestorationJob, RestorationStage, RestorationStatus
 from app.models.revoked_token import RevokedToken
 from app.models.subscription import Subscription, SubscriptionStatus
 from app.models.user import User, UserRole
@@ -23,6 +24,9 @@ __all__ = [
     "ProcessingJob",
     "JobStatus",
     "OutputFile",
+    "RestorationJob",
+    "RestorationStage",
+    "RestorationStatus",
     "BillingEvent",
     "RevokedToken",
     "RefreshToken",

@@ -241,6 +241,19 @@ class Settings(BaseSettings):
     # <dir>/<user_id>/<project_id>/stems/<name>.wav.
     stems_local_dir: str = ""
 
+    # --- Restoration service (the V2/V3 enhancement pipeline, a separate GPU host) ---
+    # That API is not browser-callable: it has no CORS and authenticates with a static
+    # X-API-Key, which cannot be shipped to a frontend. So this backend is the only
+    # caller and proxies for the browser. Blank URL disables the feature outright.
+    restoration_api_url: str = ""
+    restoration_api_key: str = ""
+    # Its queue is one job deep on one GPU, so a call can block behind another run.
+    # Generous connect/read budget, but never unbounded.
+    restoration_timeout_seconds: float = 30.0
+    # TTL for the URLs we re-sign for the browser. The upstream mints 1h URLs at job
+    # completion; a user with the page open longer than that needs a fresh one.
+    restoration_url_expire_seconds: int = 3600
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -262,6 +275,15 @@ class Settings(BaseSettings):
     @property
     def allowed_image_content_type_set(self) -> set[str]:
         return {t.strip().lower() for t in self.allowed_image_content_types.split(",") if t.strip()}
+
+    @property
+    def restoration_enabled(self) -> bool:
+        """Both halves are required: a URL with no key gets 401 on every call."""
+        return bool(self.restoration_api_url.strip() and self.restoration_api_key.strip())
+
+    @property
+    def restoration_base_url(self) -> str:
+        return self.restoration_api_url.strip().rstrip("/")
 
     @property
     def worker_engine_version_list(self) -> list[str]:

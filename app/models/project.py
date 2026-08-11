@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from app.models.output_file import OutputFile
     from app.models.processing_job import ProcessingJob
     from app.models.project_file import ProjectFile
+    from app.models.restoration_job import RestorationJob
     from app.models.user import User
 
 
@@ -51,4 +52,10 @@ class Project(Base, TimestampMixin):
     )
     output_files: Mapped[list["OutputFile"]] = relationship(
         "OutputFile", back_populates="project", cascade="all, delete-orphan"
+    )
+    restoration_jobs: Mapped[list["RestorationJob"]] = relationship(
+        "RestorationJob",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="RestorationJob.created_at",
     )

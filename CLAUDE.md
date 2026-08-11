@@ -80,6 +80,18 @@ api/v1/endpoints/*.py  → services/*.py  → repositories/*.py  → models/*.py
 - **Uploads are presigned POSTs, not PUTs.** An S3 bucket has no `file_size_limit`/`allowed_mime_types` the way a Supabase bucket did, so those constraints live in the presign policy (`content-length-range` + an exact `Content-Type` condition) and S3 rejects violating uploads itself. Clients must send `multipart/form-data` with every returned `fields` entry before the `file` part. `complete_upload` still re-checks the real stored size — a URL can outlive a plan downgrade.
 - `tests/test_storage.py` exercises the real boto3 calls against `moto`'s in-process S3 (no network, no account); the rest of the suite mocks `app.core.storage` wholesale.
 
+### Audio restoration (separate from stem separation)
+
+A **second, unrelated pipeline**: separation splits one track into stems; restoration repairs and enhances one piece of audio. It runs on an external GPU service (the `separate-steam-and-enhance-audio` repo) that this backend **proxies** — that service has no CORS and authenticates with a static `X-API-Key`, so it is not browser-callable and the key must never reach the frontend.
+
+- **Two stages, chained.** `v2` = localized MIDI repair; `v3` = tempo/denoise/bandwidth. They are **separate upstream jobs and separate `restoration_jobs` rows**, because V3's *input is V2's output file* — V3 cannot be submitted until V2 has finished and written it. The caller chains them: start `v2`, poll to `done`, then start `v3` with `after_job_id` set to the V2 row. Omitting `after_job_id` runs V3 straight off the original (no repair stage). Note the upstream's own `/v3/restore` runs with `do_stage_a=False` and **never** applies V2 — the chain is what makes a run V2-then-V3.
+- **Audio never round-trips through an API process.** Both services exchange S3 keys: the browser uploads via the normal presigned POST, then `restoration_service` submits `{source_key, source_bucket, key_prefix}` to the upstream's `*-from-s3` endpoints. `source_bucket` matters — inputs live in `S3_BUCKET_INPUTS` but the upstream defaults to its own results bucket, so omitting it looks in the wrong place. `key_prefix` is `{user_id}/{project_id}/restored` so results are addressable by owner.
+- **`restoration_jobs` exists because the upstream is not durable.** It keeps jobs in memory, evicts past 200, and loses all of them on restart. A poll that 404s upstream marks the row FAILED rather than spinning forever; a row already `done` is never re-fetched, or a restart would trade a stored result for a 404.
+- **Output URLs are signed per request** in `to_response()`, never stored — the upstream's are 1h and would be dead on page reload.
+- Progress is a **step log (`list[str]`), not a percentage** — the pipeline does not emit one, so the UI shows the latest label instead of a bar.
+- Config is `RESTORATION_API_URL` / `RESTORATION_API_KEY`; blank URL disables the feature and every endpoint answers 503. `GET /api/v1/restoration/status` reports reachability, CUDA, and whether the Apollo checkout exists (bandwidth extension raises without it).
+- `tests/test_restoration.py` stubs the upstream on an httpx `MockTransport`, so the real request/response and error-translation paths run with no GPU host.
+
 ### Conventions to follow when extending this codebase
 
 - New resources follow the full vertical slice: model → repository → schema → service → endpoint → router registration.
@@ -93,3 +105,6 @@ api/v1/endpoints/*.py  → services/*.py  → repositories/*.py  → models/*.py
 ### Reference skills
 
 `.agents/skills/` (gitignored, local-only) contains the FastAPI architecture template this codebase follows (`fastapi-architecture/`) and Supabase-specific guidance (`supabase/`, `supabase-postgres-best-practices/`) — consult these for canonical patterns (e.g. RLS checklist, connection pooling, indexing) before making changes that touch Supabase or auth.
+
+alembic upgrade head
+python -m scripts.create_admin --email admin@example.com --password 'Admin123!' --name "Local Admin"
