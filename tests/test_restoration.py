@@ -252,12 +252,54 @@ async def test_start_is_idempotent_while_a_stage_is_running(fake_db, enabled_set
     called.assert_not_called()
 
 
+async def test_start_registers_an_upload_that_was_never_completed(fake_db, enabled_settings):
+    """The browser uploads straight to S3, so the bytes exist before any DB row does.
+
+    A restoration run does not call the upload-complete *endpoint* (that also
+    enqueues a separation job, a different pipeline). Without this, every run
+    failed with "Upload an audio file before starting restoration" even though the
+    object was sitting in the bucket.
+    """
+    user_id = uuid.uuid4()
+    empty = make_project(user_id, with_file=False)
+    registered = make_project(user_id, with_file=True)
+    registered.id = empty.id
+    seen = {}
+
+    def handler(request):
+        seen["body"] = __import__("json").loads(request.content)
+        return httpx.Response(202, json={"job_id": "j1", "status": "queued", "poll": "/jobs/j1"})
+
+    with stub_upstream(handler), \
+         patch("app.services.restoration_service.project_repository") as repo, \
+         patch("app.services.restoration_service.project_service") as svc, \
+         patch_repo("get_active", None), \
+         patch.object(
+             restoration_service.repository, "create",
+             AsyncMock(side_effect=lambda db, **kw: make_job(**kw))):
+        repo.get_for_user = AsyncMock(return_value=empty)
+        svc.complete_upload = AsyncMock(return_value=registered)
+        job = await restoration_service.start(
+            fake_db, project_id=empty.id, user_id=user_id, payload=RestorationStartRequest()
+        )
+
+    svc.complete_upload.assert_awaited_once()
+    assert seen["body"]["source_key"] == registered.input_files[0].storage_key
+    assert job.remote_job_id == "j1"
+
+
 async def test_start_requires_an_input_file(fake_db, enabled_settings):
+    """Nothing recorded *and* nothing in the bucket — a genuinely empty project."""
     user_id = uuid.uuid4()
     project = make_project(user_id, with_file=False)
     with patch("app.services.restoration_service.project_repository") as repo, \
+         patch("app.services.restoration_service.project_service") as svc, \
          patch_repo("get_active", None):
         repo.get_for_user = AsyncMock(return_value=project)
+        # What complete_upload really raises when the prefix holds no objects.
+        svc.complete_upload = AsyncMock(
+            side_effect=ValueError("No uploaded file found for this project")
+        )
         with pytest.raises(RestorationError) as exc:
             await restoration_service.start(
                 fake_db, project_id=project.id, user_id=user_id, payload=RestorationStartRequest()
@@ -354,6 +396,25 @@ async def test_busy_queue_surfaces_as_503(fake_db, enabled_settings):
 
     assert exc.value.status_code == 503
     assert "waiting" in str(exc.value)
+
+
+async def test_html_response_reads_as_unreachable_not_a_crash(enabled_settings):
+    """A URL pointing at the wrong service must degrade, not 500.
+
+    Streamlit answers every path with its HTML shell — including /health — so a URL
+    left pointing at the demo UI returns 200 with HTML. Parsing that as JSON used to
+    raise straight out of the status endpoint whose whole job is to report the
+    problem.
+    """
+    def handler(request):
+        return httpx.Response(200, html="<!DOCTYPE html><html><body>Streamlit</body></html>")
+
+    with stub_upstream(handler):
+        status = await restoration_service.service_status()
+
+    assert status.enabled is True
+    assert status.reachable is False
+    assert "RESTORATION_API_URL" in (status.detail or "")
 
 
 # --- presentation --------------------------------------------------------

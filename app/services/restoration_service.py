@@ -30,6 +30,7 @@ from app.schemas.restoration import (
     RestorationServiceStatus,
     RestorationStartRequest,
 )
+from app.services.project_service import FileTooLargeError, project_service
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,29 @@ class RestorationService:
                 raise RestorationError(detail or "The restoration service is busy.", 503)
             raise RestorationError(detail or "The restoration service rejected the request.", 502)
 
-        return response.json()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            # A 200 that isn't JSON means the URL points at something that is not this
+            # API — pointing it at a Streamlit UI is the easy mistake, since Streamlit
+            # answers *every* path with its HTML shell, including /health. Treat it as
+            # unreachable: a misconfigured URL must read as "service down", not crash
+            # the status endpoint that exists to report exactly that.
+            logger.error(
+                "Restoration service returned %s, not JSON, for %s — is RESTORATION_API_URL "
+                "pointing at the API?",
+                response.headers.get("content-type", "?"),
+                path,
+            )
+            raise RestorationError(
+                "The restoration service returned an unexpected response. "
+                "Check RESTORATION_API_URL points at the restoration API.",
+                502,
+            ) from exc
+
+        if not isinstance(body, dict):
+            raise RestorationError("The restoration service returned an unexpected response.", 502)
+        return body
 
     # --- status -------------------------------------------------------------
 
@@ -217,6 +240,25 @@ class RestorationService:
                     "The previous stage has not finished — its output does not exist yet.", 409
                 )
             return parent.output_key, parent.output_bucket or storage.BUCKET_STEMS, parent
+
+        if not project.input_files:
+            # The browser uploaded straight to S3, so the bytes exist but nothing has
+            # recorded them yet — `ProjectFile` rows are written by `complete_upload`,
+            # and a restoration run deliberately does not call the endpoint that wraps
+            # it (that endpoint also enqueues a *separation* job, which is a different
+            # pipeline and would burn GPU nobody asked for).
+            #
+            # So register them here, through the same service call: it lists the real
+            # objects rather than trusting the client, re-checks each size against the
+            # plan, and is idempotent. Only the enqueue is skipped.
+            try:
+                project = await project_service.complete_upload(
+                    db, project_id=project.id, user_id=user_id
+                ) or project
+            except FileTooLargeError as exc:
+                raise RestorationError(str(exc), 413) from exc
+            except ValueError as exc:
+                raise RestorationError(str(exc), 400) from exc
 
         if not project.input_files:
             raise RestorationError("Upload an audio file before starting restoration.", 400)
