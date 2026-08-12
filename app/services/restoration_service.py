@@ -10,7 +10,9 @@ into ``restoration_jobs`` so a finished result survives that, and so a job stays
 attributable to a user and project after the fact.
 """
 
+import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +32,7 @@ from app.schemas.restoration import (
     RestorationServiceStatus,
     RestorationStartRequest,
 )
+from app.services import restoration_progress
 from app.services.project_service import FileTooLargeError, project_service
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,13 @@ class RestorationDisabled(RestorationError):
 class RestorationService:
     def __init__(self) -> None:
         self.repository = restoration_job_repository
+        # Shared health cache — see `service_status`. Process-local, like the login
+        # rate limiter: with several API instances each keeps its own, which still
+        # cuts the probe rate by the poll interval and is the right trade for one
+        # cheap boolean.
+        self._status_cache: tuple[str, RestorationServiceStatus] | None = None
+        self._status_at: float = 0.0
+        self._status_lock = asyncio.Lock()
 
     # --- upstream transport -------------------------------------------------
 
@@ -133,12 +143,53 @@ class RestorationService:
     # --- status -------------------------------------------------------------
 
     async def service_status(self) -> RestorationServiceStatus:
-        """Health of the upstream, as something the UI can gate a button on."""
+        """Health of the upstream, as something the UI can gate a button on.
+
+        Cached for a few seconds and shared across callers. Every open restoration
+        page re-checks this on a timer, and each check was a fresh HTTPS round trip
+        to the GPU host — a host that is, by design, busy running one job at a time
+        and answering that probe on the same event loop. With more than a handful of
+        viewers the health probes alone were a measurable share of its traffic, and
+        the answer does not change between two viewers a second apart.
+
+        A single in-flight refresh is shared rather than raced, so N simultaneous
+        cache misses make one upstream call, not N.
+        """
         settings = get_settings()
         if not settings.restoration_enabled:
             return RestorationServiceStatus(
                 enabled=False, reachable=False, detail="Not configured on this server."
             )
+
+        ttl = settings.restoration_status_cache_seconds
+        # Keyed by the upstream it describes, so pointing the deployment at a
+        # different host cannot be answered out of the previous host's cache.
+        key = settings.restoration_base_url
+
+        cached = self._cached_status(key, ttl)
+        if cached is not None:
+            return cached
+
+        async with self._status_lock:
+            # Re-check inside the lock: whoever held it may have just refreshed,
+            # and this waiter should take that result rather than issue its own.
+            cached = self._cached_status(key, ttl)
+            if cached is not None:
+                return cached
+            status = await self._fetch_status()
+            self._status_cache = (key, status)
+            self._status_at = time.monotonic()
+            return status
+
+    def _cached_status(self, key: str, ttl: float) -> RestorationServiceStatus | None:
+        if self._status_cache is None:
+            return None
+        cached_key, status = self._status_cache
+        if cached_key != key or time.monotonic() - self._status_at >= ttl:
+            return None
+        return status
+
+    async def _fetch_status(self) -> RestorationServiceStatus:
         try:
             # `/health` is the one open route upstream — no key needed, but sending
             # ours costs nothing and keeps one code path.
@@ -153,6 +204,11 @@ class RestorationService:
             apollo=bool(data.get("apollo")),
             bucket_configured=bool(data.get("bucket_configured")),
             queue_depth=int(data.get("queue_depth") or 0),
+            device=str(data.get("device") or ""),
+            precision=str(data.get("precision") or ""),
+            # Absent on an older upstream, which had no preload step and so was never
+            # cold in this sense. Default to warm so it does not raise a false alarm.
+            warm=bool(data.get("warm", True)),
         )
 
     # --- starting a stage ---------------------------------------------------
@@ -309,6 +365,11 @@ class RestorationService:
 
         job.status = status
         job.progress = list(data.get("progress") or [])
+        # Not a column: how many runs are ahead of this one is true for as long as
+        # this response takes to reach the browser and no longer, so persisting it
+        # would only let a stale number outlive its meaning. Carried on the instance
+        # for `to_response` to read on this request alone.
+        job.queue_position = int(data.get("queue_position") or 0)
         job.report = data.get("report")
         job.quality = data.get("quality")
         job.error_message = data.get("error")
@@ -362,6 +423,16 @@ class RestorationService:
                 ),
                 expires_in=expires_in,
             )
+        started = job.created_at
+        end = job.completed_at or datetime.now(timezone.utc)
+        # `created_at` is timezone-aware from the column, but a row built in a test or
+        # refreshed from a driver that dropped the offset would make this subtraction
+        # raise — and a progress field must never be the thing that fails a poll.
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
         return RestorationJobResponse(
             id=job.id,
             project_id=job.project_id,
@@ -370,6 +441,9 @@ class RestorationService:
             parent_id=job.parent_id,
             progress=progress,
             current_step=progress[-1] if progress else "",
+            progress_pct=restoration_progress.estimate(job.stage, job.status, progress),
+            queue_position=int(getattr(job, "queue_position", 0) or 0),
+            elapsed_seconds=max(0, int((end - started).total_seconds())),
             is_finished=job.is_finished,
             output=output,
             report=job.report,

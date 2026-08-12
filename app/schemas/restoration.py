@@ -49,11 +49,20 @@ class RestorationJobResponse(BaseModel):
     status: RestorationStatus
     parent_id: uuid.UUID | None = None
 
-    # The upstream's step log rather than a percentage — the pipeline does not
-    # report one, and inventing a number here would be a lie the UI renders as a bar.
+    # The upstream's step log. The pipeline reports labelled steps, not a number.
     progress: list[str] = Field(default_factory=list)
     # Convenience for the UI: the last progress line, or "" before the first.
     current_step: str = ""
+    # A completion estimate derived from those steps — see restoration_progress.py
+    # for why a milestone-based estimate beats showing text alone on a run that takes
+    # minutes. Monotonic, and never 100 until `is_finished`.
+    progress_pct: int = 0
+    # Jobs ahead of this one on the upstream's single GPU worker. 0 once it is
+    # running. Without it, "queued behind two other runs" and "hung" look the same.
+    queue_position: int = 0
+    # Wall clock since the row was created, so the UI can show a timer instead of an
+    # invented countdown.
+    elapsed_seconds: int = 0
     is_finished: bool = False
 
     output: RestorationOutput | None = None
@@ -81,4 +90,13 @@ class RestorationServiceStatus(BaseModel):
     apollo: bool = False
     bucket_configured: bool = False
     queue_depth: int = 0
+    # The device jobs actually run on, and in what precision. Distinct from `cuda`,
+    # which only says the host has a GPU — a host pinned to the CPU reports cuda=true
+    # and still runs everything on it, which is worth telling the user before a run
+    # rather than after twenty minutes.
+    device: str = ""
+    precision: str = ""
+    # False while the host is still downloading checkpoints after a restart. The first
+    # run on a cold host spends minutes on that before any step appears.
+    warm: bool = True
     detail: str | None = None

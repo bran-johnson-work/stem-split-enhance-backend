@@ -30,7 +30,12 @@ def enabled_settings():
     url, key = settings.restoration_api_url, settings.restoration_api_key
     settings.restoration_api_url = "http://restore.test"
     settings.restoration_api_key = "test-key"
+    # The service caches `/health` per upstream URL, and every test here points at
+    # the same one — so without this a test that stubbed an unreachable host would
+    # answer the next test's status call out of the cache.
+    restoration_service._status_cache = None
     yield settings
+    restoration_service._status_cache = None
     settings.restoration_api_url, settings.restoration_api_key = url, key
 
 
@@ -442,3 +447,100 @@ def test_to_response_has_no_output_before_completion(enabled_settings):
     assert body.output is None
     assert body.is_finished is False
     assert body.current_step == ""
+
+
+# --- progress reporting --------------------------------------------------
+
+
+def test_progress_pct_tracks_the_step_log_and_never_reaches_100_while_running():
+    """The bar is derived from named steps and stops short of done.
+
+    A V2+V3 run is minutes of GPU work behind a single line of changing text. The
+    estimate exists so that reads as progress rather than as a hang — but a bar that
+    hits 100 and keeps working is worse than no bar, so `is_finished` stays the only
+    thing that reports completion.
+    """
+    early = restoration_service.to_response(
+        make_job(status=RestorationStatus.RUNNING, progress=["Fetching source audio"])
+    )
+    late = restoration_service.to_response(
+        make_job(
+            status=RestorationStatus.RUNNING,
+            progress=["Fetching source audio", "Stage A / 3b - crossfade splice + re-verify"],
+        )
+    )
+
+    assert 0 < early.progress_pct < late.progress_pct < 100
+
+
+def test_progress_pct_does_not_retreat_when_a_later_step_scores_lower():
+    """Later steps are not always further along.
+
+    V3 emits "Wrote <name>.wav" after each stem and then starts the next stem's
+    denoise pass, so reading only the *last* line walks the bar backwards.
+    """
+    job = make_job(
+        stage=RestorationStage.V3,
+        status=RestorationStatus.RUNNING,
+        progress=[
+            "Step 3 - extending bandwidth of vocals",
+            "Wrote vocals_restored.wav",
+            "Step 2 - denoising drums",
+        ],
+    )
+    body = restoration_service.to_response(job)
+
+    # "Wrote" is the furthest milestone reached; the trailing denoise line is behind it.
+    assert body.progress_pct >= 90
+
+
+def test_finished_job_reports_100():
+    body = restoration_service.to_response(
+        make_job(status=RestorationStatus.DONE, progress=["Fetching source audio"])
+    )
+    assert body.progress_pct == 100
+
+
+def test_failed_job_keeps_the_progress_it_reached():
+    """How far it got is the useful part of a failure; snapping to 0 erases it."""
+    body = restoration_service.to_response(
+        make_job(
+            status=RestorationStatus.FAILED,
+            progress=["Fetching source audio", "Stage A / 1b - MIDI transcription (MuScriptor)"],
+        )
+    )
+    assert body.progress_pct >= 40
+
+
+async def test_status_is_cached_between_calls(enabled_settings):
+    """Two viewers a second apart make one call to the GPU host, not two."""
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"ok": True, "cuda": True, "device": "cuda",
+                                         "precision": "fp16", "warm": True})
+
+    with stub_upstream(handler):
+        first = await restoration_service.service_status()
+        second = await restoration_service.service_status()
+
+    assert len(calls) == 1
+    assert first.device == "cuda" and first.precision == "fp16"
+    assert second.reachable is True
+
+
+async def test_status_cache_is_keyed_by_upstream_url(enabled_settings):
+    """Repointing the deployment must not be answered from the old host's cache."""
+    def unreachable(request):
+        raise httpx.ConnectError("down")
+
+    def healthy(request):
+        return httpx.Response(200, json={"ok": True, "cuda": True})
+
+    with stub_upstream(unreachable):
+        assert (await restoration_service.service_status()).reachable is False
+
+    enabled_settings.restoration_api_url = "http://other-host.test"
+    with stub_upstream(healthy):
+        assert (await restoration_service.service_status()).reachable is True

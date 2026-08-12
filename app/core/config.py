@@ -253,6 +253,12 @@ class Settings(BaseSettings):
     # TTL for the URLs we re-sign for the browser. The upstream mints 1h URLs at job
     # completion; a user with the page open longer than that needs a fresh one.
     restoration_url_expire_seconds: int = 3600
+    # How long a `/health` answer from the GPU host is reused for. Every open
+    # restoration page re-checks availability on a timer, and each check was its own
+    # round trip to a host that is busy running a job. Ten seconds is far below the
+    # frontend's own poll interval and far above the rate at which "is there a GPU"
+    # can meaningfully change.
+    restoration_status_cache_seconds: float = 10.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
