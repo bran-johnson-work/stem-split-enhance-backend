@@ -1,9 +1,39 @@
-# syntax=docker/dockerfile:1
 
-# CPU-only image for the stem-separation worker (app.worker).
-# The API is deployed separately from its own image; this one carries the heavy
-# torch/demucs stack and runs the Postgres-queue consumer.
-FROM python:3.11-slim
+# Default = CPU wheels (smallest). Override per the header for a GPU build.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+
+# ---- Stage 1: builder — resolve deps into a self-contained venv ----
+FROM ${PYTHON_IMAGE} AS builder
+ARG TORCH_INDEX_URL
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# Install torch/torchaudio FIRST from the selected index so the CPU-vs-CUDA variant
+# is pinned before the rest of the tree resolves torch. The version range matches
+# requirements-worker.txt, so the subsequent `-r` leaves this wheel untouched
+# instead of re-pulling a default-index (wrong-variant) build.
+RUN pip install --index-url ${TORCH_INDEX_URL} "torch>=2.11,<2.12" "torchaudio>=2.11,<2.12"
+
+COPY requirements.txt requirements-worker.txt ./
+RUN pip install -r requirements-worker.txt
+
+# ---- Stage 2: runtime — slim final image, no build tooling / pip cache ----
+FROM ${PYTHON_IMAGE} AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TORCH_HOME=/cache/torch \
+    PATH="/opt/venv/bin:$PATH"
 
 # libsndfile1: audio decoding for soundfile. ffmpeg is optional (only for exotic
 # formats like M4A/WMA that libsndfile can't read) — add it if you need them.
@@ -11,22 +41,21 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TORCH_HOME=/cache/torch
-
 WORKDIR /app
 
-# Install CPU-only torch first from PyTorch's CPU index so the default CUDA wheels
-# (~2-3 GB) are never pulled. The rest then see torch already satisfied.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu \
-        "torch>=2.2,<3.0" "torchaudio>=2.2,<3.0"
+# The built venv (torch/demucs/…) is the only heavy artifact carried over.
+COPY --from=builder /opt/venv /opt/venv
 
-COPY requirements.txt requirements-worker.txt ./
-RUN pip install -r requirements-worker.txt
-
-COPY app ./app
+# Worker-only import closure (verified): engine + worker + the shared core/models/
+# repositories/schemas layers. The API (app/api), app/main.py and app/services are
+# NOT part of the worker's graph, so they're intentionally left out of this image.
+# When a new package enters the worker's imports, add it here.
+COPY app/core ./app/core
+COPY app/models ./app/models
+COPY app/repositories ./app/repositories
+COPY app/schemas ./app/schemas
+COPY app/engine ./app/engine
+COPY app/worker ./app/worker
 COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 
@@ -40,6 +69,6 @@ USER appuser
 # Mount a volume to persist them across restarts.
 VOLUME ["/cache/torch"]
 
-# Needs the same env as the API (DATABASE_URL_POOLED, SUPABASE_URL,
-# SUPABASE_SERVICE_ROLE_KEY, …) so it can reach Postgres + Storage.
+# Needs the same env as the API (POSTGRES_* / AWS_* / S3_* …) so it can reach
+# Postgres + S3, plus WORKER_DEVICE=cuda on a GPU host.
 CMD ["python", "-m", "app.worker"]

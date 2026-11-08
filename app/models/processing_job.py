@@ -1,10 +1,10 @@
 import enum
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, new_uuid
@@ -38,6 +38,19 @@ class ProcessingJob(Base, TimestampMixin):
     current_step: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     engine_job_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    # --- Engine version (A/B: v1 = HT-Demucs, v2 = Mel-Band RoFormer) ---
+    # Which engine build owns this job. A worker claims only the versions listed in
+    # its own WORKER_ENGINE_VERSIONS, so one queue can feed two differently-built
+    # containers without either stealing the other's work.
+    engine_version: Mapped[str] = mapped_column(
+        String(16), default="v1", server_default="v1", nullable=False
+    )
+    # The settings this run actually used. Recorded because a v2 stem rendered at
+    # overlap 2 is not the same artifact as one at overlap 4, and without the record
+    # an A/B comparison months later is uninterpretable.
+    engine_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_current_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.job import JobResponse, JobStemsResponse
+from app.schemas.job import JobResponse, JobStemsResponse, StemsCompareResponse
 from app.services.job_service import job_service
 
 router = APIRouter()
@@ -36,6 +36,29 @@ async def start_processing(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return job
+
+
+@router.get("/{project_id}/stems/compare", response_model=StemsCompareResponse)
+async def compare_stems(
+    project_id: uuid.UUID,
+    expires_in: int = Query(3600, gt=0, le=604800),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Every engine version that has run for this project, with signed stem URLs.
+
+    Backs the side-by-side v1-vs-v2 comparison view in one round trip. ``stem_names`` is
+    the union across versions in display order — the versions can disagree about which
+    stems a track contains, so the UI renders an explicit "not detected in this version"
+    cell rather than a missing row. A version still rendering returns an empty ``stems``
+    list with its real status, so the finished version is listenable immediately.
+    """
+    result = await job_service.get_stems_comparison(
+        db, project_id=project_id, user_id=current_user.id, expires_in=expires_in
+    )
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return result
 
 
 @router.get("/{project_id}/jobs", response_model=list[JobResponse])

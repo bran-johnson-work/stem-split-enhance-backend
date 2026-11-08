@@ -39,13 +39,19 @@ async def test_create_project_success(auth_client, monkeypatch, sample_user):
     assert resp.json()["id"] == str(project.id)
 
 
-async def test_create_project_quota_exceeded(auth_client, monkeypatch):
+async def test_upload_url_file_quota_exceeded(auth_client, monkeypatch):
+    # The metered unit is audio files: the monthly cap is enforced when a file's
+    # upload URL is requested (projects themselves are unlimited), surfacing 400.
+    project_id = uuid.uuid4()
     monkeypatch.setattr(
         projects_module.project_service,
-        "create_project",
-        AsyncMock(side_effect=ValueError("Monthly project limit reached (3).")),
+        "create_file_upload_url",
+        AsyncMock(side_effect=ValueError("Monthly upload limit reached (3 audio files).")),
     )
-    resp = await auth_client.post("/api/v1/projects", json={"name": "My song"})
+    resp = await auth_client.post(
+        f"/api/v1/projects/{project_id}/files/upload-url",
+        json={"filename": "song.wav", "content_type": "audio/wav"},
+    )
     assert resp.status_code == 400
     assert "limit reached" in resp.json()["detail"]
 
@@ -57,7 +63,11 @@ async def test_create_project_requires_auth(client):
 
 async def test_create_project_upload_url_success(auth_client, monkeypatch, sample_user):
     project = _project(sample_user.id)
-    signed = {"storage_key": "key/song.wav", "url": "https://up.example", "token": "tok"}
+    signed = {
+        "storage_key": "key/song.wav",
+        "url": "https://up.example",
+        "fields": {"key": "key/song.wav", "Content-Type": "audio/wav"},
+    }
     monkeypatch.setattr(
         projects_module.project_service,
         "create_file_upload_url",
@@ -70,7 +80,7 @@ async def test_create_project_upload_url_success(auth_client, monkeypatch, sampl
     assert resp.status_code == 201
     body = resp.json()
     assert body["project_id"] == str(project.id)
-    assert body["token"] == "tok"
+    assert body["fields"]["key"] == "key/song.wav"
 
 
 async def test_create_project_upload_url_not_found(auth_client, monkeypatch):
@@ -134,7 +144,11 @@ async def test_delete_project_not_found(auth_client, monkeypatch):
 
 async def test_create_upload_url_success(auth_client, monkeypatch, sample_user):
     project = _project(sample_user.id)
-    signed = {"storage_key": "key/song.wav", "url": "https://up.example", "token": "tok"}
+    signed = {
+        "storage_key": "key/song.wav",
+        "url": "https://up.example",
+        "fields": {"key": "key/song.wav", "Content-Type": "audio/wav"},
+    }
     monkeypatch.setattr(
         projects_module.project_service,
         "create_upload_url",
@@ -148,7 +162,7 @@ async def test_create_upload_url_success(auth_client, monkeypatch, sample_user):
     body = resp.json()
     assert body["project_id"] == str(project.id)
     assert body["url"] == "https://up.example"
-    assert body["token"] == "tok"
+    assert body["fields"]["key"] == "key/song.wav"
 
 
 async def test_create_upload_url_rejects_bad_type(auth_client, monkeypatch):

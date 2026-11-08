@@ -42,18 +42,53 @@ _models: dict[str, tuple[object, str]] = {}
 _load_lock = threading.Lock()
 
 
-def _pick_device() -> str:
-    """Best available compute: CUDA GPU, else Apple Silicon (MPS), else CPU.
+def _mps_available() -> bool:
+    """True on Apple Silicon with a working MPS backend; False everywhere else.
 
-    The MPS check is guarded so it cannot raise on platforms without it (it returns
-    False off Apple hardware). CPU works everywhere; it is just slower.
+    Guarded so it can't raise on platforms where torch has no ``mps`` backend.
     """
-    if torch.cuda.is_available():
-        return "cuda"
     mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
+    return bool(mps is not None and mps.is_available())
+
+
+def _pick_device() -> str:
+    """Resolve the compute device from ``settings.worker_device``.
+
+    - ``auto`` (default): best available — CUDA GPU > Apple MPS > CPU.
+    - ``cuda`` / ``cuda:N``: *require* that GPU. If CUDA isn't visible we raise
+      rather than silently fall back to CPU — on a rented AWS GPU box a silent CPU
+      fallback would run 10-50x slower with no signal, wasting the instance.
+    - ``mps``: require Apple MPS (raises if unavailable).
+    - ``cpu``: force CPU (works everywhere, just slower).
+    """
+    configured = (get_settings().worker_device or "auto").strip().lower()
+
+    if configured in ("", "auto"):
+        if torch.cuda.is_available():
+            return "cuda"
+        return "mps" if _mps_available() else "cpu"
+
+    if configured.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"WORKER_DEVICE={configured!r} requires CUDA, but torch.cuda.is_available() "
+                "is False. On an AWS GPU host check: this is a GPU instance, the NVIDIA "
+                "driver + nvidia-container-toolkit are installed, the container was started "
+                "with `--gpus all`, and torch is a CUDA build (GPU wheels, not the cpu index)."
+            )
+        return configured
+
+    if configured == "mps":
+        if not _mps_available():
+            raise RuntimeError("WORKER_DEVICE='mps' requested but the MPS backend is unavailable.")
         return "mps"
-    return "cpu"
+
+    if configured == "cpu":
+        return "cpu"
+
+    raise RuntimeError(
+        f"Unrecognized WORKER_DEVICE={configured!r}; use one of: auto | cpu | cuda | cuda:N | mps."
+    )
 
 
 def weights_cached() -> bool:
@@ -96,6 +131,13 @@ def get_model_and_device(name: str | None = None):
         if cached is not None:  # another thread finished while we waited
             return cached
         device = _pick_device()
+        if device.startswith("cuda"):
+            # Fixed-size chunks from apply_model -> cuDNN autotuner pays off after warmup.
+            torch.backends.cudnn.benchmark = True
+            try:
+                logger.info("model.device.cuda name=%s", torch.cuda.get_device_name(0))
+            except Exception:  # pragma: no cover - purely informational
+                pass
         logger.info("model.loading name=%s device=%s (first run downloads weights)", name, device)
         model = get_model(name)
         model.to(device)
@@ -125,13 +167,24 @@ def separate_sources(
     device: str,
     wav: torch.Tensor,
     on_model_done: Callable[[int, int], None] | None = None,
+    shifts: int | None = None,
+    overlap: float | None = None,
 ) -> dict[str, np.ndarray]:
     """Run HT-Demucs on a (channels, samples) tensor; return {source: (channels, samples)}.
 
     Replicates demucs' own bag-of-models weighted averaging so the result is identical
     to demucs.apply.apply_model, while letting the caller observe per-model progress
     (apply_model in 4.0.1 exposes no progress callback).
+
+    ``shifts`` / ``overlap`` are the demucs quality dials (defaults come from Settings):
+    more shifts = less bleed between stems at ~linear cost; more overlap = smoother seams.
     """
+    settings = get_settings()
+    shifts = settings.demucs_shifts if shifts is None else shifts
+    overlap = settings.demucs_overlap if overlap is None else overlap
+    shifts = max(1, int(shifts))
+    overlap = min(0.95, max(0.0, float(overlap)))
+
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
     mix = wav[None]  # (1, channels, samples); apply_model moves chunks to device
@@ -142,7 +195,9 @@ def separate_sources(
             estimates = 0.0
             totals = [0.0] * len(model.sources)
             for i, (sub, weights) in enumerate(zip(model.models, model.weights, strict=False)):
-                out = apply_model(sub, mix, shifts=1, split=True, overlap=0.25, device=device)
+                out = apply_model(
+                    sub, mix, shifts=shifts, split=True, overlap=overlap, device=device
+                )
                 for k, w in enumerate(weights):
                     out[:, k, :, :] *= w
                     totals[k] += w
@@ -153,7 +208,9 @@ def separate_sources(
             for k in range(estimates.shape[1]):
                 estimates[:, k, :, :] /= totals[k]
         else:
-            estimates = apply_model(model, mix, shifts=1, split=True, overlap=0.25, device=device)
+            estimates = apply_model(
+                model, mix, shifts=shifts, split=True, overlap=overlap, device=device
+            )
             if on_model_done:
                 on_model_done(1, 1)
 
@@ -328,9 +385,18 @@ def enhance_stem(
     sr: int,
     stem_name: str,
     reference: np.ndarray | None = None,
+    level: str = "full",
 ) -> np.ndarray:
     """Post-process one stem against Suno artifacts (vocals get the most help).
 
+    ``level`` controls how aggressive the chain is:
+      * ``"full"``  — the whole restoration chain (steps 1-5 below). Tuned for AI-generated
+        (Suno) audio; can over-color clean real recordings.
+      * ``"light"`` — gentle denoise + reference matching + safety limit only. Skips the
+        harmonic exciter and multiband saturation (the steps that add "color"/harmonics),
+        so real-music stems stay faithful and don't sound processed/"messy".
+
+    full chain:
     1. Artifact reduction via spectral denoising (noisereduce).
     2. Spectral repair / de-click.
     3. Reference-guided spectral matching (bonus mode, when a reference is supplied).
@@ -346,30 +412,40 @@ def enhance_stem(
                 sr,
                 stem_name,
                 reference[c] if reference is not None and reference.ndim == 2 else reference,
+                level,
             )
             for c in range(audio.shape[0])
         ]
         return np.stack(chs, axis=0).astype(np.float32)
 
+    light = level == "light"
     y = audio.astype(np.float32)
 
-    # 1. Artifact reduction / denoising (stronger on vocals/other).
-    prop = 0.72 if stem_name in ("vocals", "other") else 0.45
+    # 1. Artifact reduction / denoising (stronger on vocals/other; softened in light mode
+    #    so a clean stem isn't pushed into "musical noise").
+    if light:
+        prop = 0.35 if stem_name in ("vocals", "other") else 0.2
+    else:
+        prop = 0.72 if stem_name in ("vocals", "other") else 0.45
     y = nr.reduce_noise(y=y, sr=sr, stationary=False, prop_decrease=prop)
 
-    # 2. Light de-click / repair for clicks and gaps.
-    y = _declick(y, threshold=0.07 if stem_name == "vocals" else 0.12)
+    # 2. Light de-click / repair for clicks and gaps (full mode only — real mixes rarely
+    #    have Suno-style clicks, and the duck can chew transients).
+    if not light:
+        y = _declick(y, threshold=0.07 if stem_name == "vocals" else 0.12)
 
     # 3. Reference-guided matching toward the clean section (bonus mode, if supplied).
+    #    Kept in both modes: it's gentle, clamped EQ-matching.
     if reference is not None and getattr(reference, "size", 0) > 0:
         y = match_spectral_envelope(y, np.asarray(reference, dtype=np.float32), sr)
 
-    # 4. Harmonic reconstruction / bandwidth extension (esp. vocals).
-    if stem_name in ("vocals", "other"):
-        y = _harmonic_exciter(y, sr, amount=0.32 if stem_name == "vocals" else 0.18)
+    if not light:
+        # 4. Harmonic reconstruction / bandwidth extension (esp. vocals).
+        if stem_name in ("vocals", "other"):
+            y = _harmonic_exciter(y, sr, amount=0.32 if stem_name == "vocals" else 0.18)
 
-    # 5. Multiband saturation (fullness, reduced sparseness/muddiness).
-    y = _multiband_saturation(y, sr)
+        # 5. Multiband saturation (fullness, reduced sparseness/muddiness).
+        y = _multiband_saturation(y, sr)
 
     # Safety-limit only: attenuate to avoid clipping, but never amplify. Upward make-up gain
     # would blow a near-silent stem (e.g. the vocal of an instrumental track) up into audible

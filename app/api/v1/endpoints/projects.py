@@ -15,6 +15,7 @@ from app.schemas.project import (
     UploadUrlRequest,
     UploadUrlResponse,
 )
+from app.services.job_service import job_service
 from app.services.project_service import FileTooLargeError, project_service
 
 router = APIRouter()
@@ -28,8 +29,9 @@ async def create_project(
 ) -> Any:
     """Create an empty project, then upload file(s) into it via a presigned URL.
 
-    This consumes the plan's monthly project quota; the subsequent uploads to
-    ``/{project_id}/files/upload-url`` do not.
+    Projects are unlimited; the metered unit is audio files. The monthly file
+    quota is enforced when each file's upload URL is requested at
+    ``/{project_id}/files/upload-url``, not here.
     """
     project_name = (payload.name or "").strip() or "Untitled project"
     try:
@@ -49,10 +51,10 @@ async def create_upload_url(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    """Create a project and return a one-time URL to upload its audio directly.
+    """Create a project and return a presigned POST to upload its audio directly.
 
-    The client PUTs the file to the returned ``url`` (with ``token``), then calls
-    ``/{project_id}/upload-complete`` to finalise it.
+    The client POSTs the file to the returned ``url`` as multipart/form-data with
+    the returned ``fields``, then calls ``/{project_id}/upload-complete``.
     """
     project_name = (payload.name or "").strip() or (payload.filename or "Untitled project")
     try:
@@ -76,7 +78,7 @@ async def create_upload_url(
         project_id=project.id,
         storage_key=signed["storage_key"],
         url=signed["url"],
-        token=signed["token"],
+        fields=signed["fields"],
     )
 
 
@@ -91,10 +93,10 @@ async def create_project_upload_url(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    """Mint a presigned URL to upload a file into an existing project.
+    """Mint a presigned POST to upload a file into an existing project.
 
-    The client PUTs the file to the returned ``url`` (with ``token``), then calls
-    ``/{project_id}/upload-complete`` to finalise it.
+    The client POSTs the file to the returned ``url`` as multipart/form-data with
+    the returned ``fields``, then calls ``/{project_id}/upload-complete``.
     """
     try:
         result = await project_service.create_file_upload_url(
@@ -116,7 +118,7 @@ async def create_project_upload_url(
         project_id=project.id,
         storage_key=signed["storage_key"],
         url=signed["url"],
-        token=signed["token"],
+        fields=signed["fields"],
     )
 
 
@@ -137,6 +139,13 @@ async def complete_upload(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    # Auto-enqueue processing now the upload is confirmed in storage — otherwise the
+    # project sits in QUEUED forever with no ProcessingJob for the worker to claim.
+    # Idempotent: a second call while a job is in flight returns the existing job.
+    try:
+        await job_service.enqueue(db, project_id=project_id, user_id=current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return project
 
 

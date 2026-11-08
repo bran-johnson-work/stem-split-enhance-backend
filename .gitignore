@@ -41,4 +41,7 @@ coverage.xml
 stem-engine/
 .env
 .agents/
+
+# Generated data seeds — contain password/token hashes; never commit.
+seed.sql
  

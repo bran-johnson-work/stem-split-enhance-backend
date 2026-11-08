@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -137,3 +138,80 @@ def decode_email_verification_token(token: str) -> dict[str, Any]:
     if payload.get("purpose") != EMAIL_VERIFICATION_PURPOSE:
         raise jwt.InvalidTokenError("Token is not an email-verification token")
     return payload
+
+
+# Password-reset tokens reuse the same single-purpose JWT machinery as email
+# verification: a distinct ``aud`` and this ``purpose`` claim keep them from being
+# confused with API access or email-verification tokens (either guard alone
+# suffices). Consumed single-use via the revoked-token denylist, like verification.
+PASSWORD_RESET_PURPOSE = "password_reset"
+
+
+def create_password_reset_token(user_id: str, email: str) -> str:
+    """Create a short-lived signed token authorizing a password reset.
+
+    Expires after ``password_reset_token_expire_hours`` (1h by default) and is
+    scoped to the password-reset audience so it cannot be replayed as an API
+    access or email-verification token. Binds ``email`` so a token issued before
+    an address change can be rejected.
+    """
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(hours=settings.password_reset_token_expire_hours)
+    to_encode = {
+        "sub": user_id,
+        "email": email,
+        "purpose": PASSWORD_RESET_PURPOSE,
+        "iat": now,
+        "nbf": now,
+        "exp": expire,
+        "jti": str(uuid4()),
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_password_reset_audience,
+    }
+    return jwt.encode(to_encode, settings.secret_key, algorithm=settings.jwt_algorithm)
+
+
+def decode_password_reset_token(token: str) -> dict[str, Any]:
+    """Decode and validate a password-reset token.
+
+    Enforces signature, expiry (``exp``), not-before, issuer and the dedicated
+    password-reset audience. Raises ``jwt.PyJWTError`` on any validation failure,
+    including a token whose ``purpose`` claim is not the password-reset purpose
+    (e.g. an access or email-verification token presented here).
+    """
+    payload = jwt.decode(
+        token,
+        settings.secret_key,
+        algorithms=[settings.jwt_algorithm],
+        audience=settings.jwt_password_reset_audience,
+        issuer=settings.jwt_issuer,
+        options={"require": ["exp", "iat", "sub", "jti"]},
+    )
+    if payload.get("purpose") != PASSWORD_RESET_PURPOSE:
+        raise jwt.InvalidTokenError("Token is not a password-reset token")
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Refresh tokens.
+#
+# Opaque random strings, not JWTs. A refresh token must be revocable — that is
+# the whole reason it exists — and a self-contained JWT cannot be revoked
+# without a denylist lookup anyway, so the DB row is made the authority instead.
+#
+# Only the hash is persisted (see RefreshToken.token_hash). SHA-256 with no salt
+# is correct here, unlike for passwords: the input is 256 bits of CSPRNG output,
+# so there is no dictionary to attack and nothing for a salt to defend against.
+# ---------------------------------------------------------------------------
+
+_REFRESH_TOKEN_BYTES = 32
+
+
+def create_refresh_token() -> str:
+    """Mint a new opaque refresh token. Returned once, to the client only."""
+    return secrets.token_urlsafe(_REFRESH_TOKEN_BYTES)
+
+
+def hash_refresh_token(token: str) -> str:
+    """The stored form of a refresh token: SHA-256 hex."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

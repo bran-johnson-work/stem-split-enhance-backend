@@ -81,9 +81,15 @@ class FileUploadUrlRequest(BaseModel):
 
 
 class UploadUrlResponse(BaseModel):
-    """A one-time URL the client uploads the audio file directly to Supabase with."""
+    """A presigned POST the client uploads the audio file directly to S3 with.
+
+    The client sends ``multipart/form-data`` to ``url``, including every entry of
+    ``fields`` (S3's signed policy, key, and content type) *before* the ``file``
+    part. S3 itself rejects the upload if it breaks the policy's size or
+    content-type conditions.
+    """
 
     project_id: uuid.UUID
     storage_key: str
     url: str
-    token: str
+    fields: dict[str, str]

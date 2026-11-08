@@ -11,21 +11,29 @@ if TYPE_CHECKING:
     from app.models.processing_job import ProcessingJob
     from app.models.project import Project
 
-# All possible stem names produced by the engine
-STEM_NAMES = frozenset(
-    {
-        "vocals",
-        "drums",
-        "kick",
-        "snare",
-        "hihats",
-        "bass",
-        "guitar",
-        "piano",
-        "other",
-        "original",
-    }
+# Every stem name the engine can produce, in display order: vocals, the drum kit (full +
+# kick/snare/hi-hats), bass, the two instruments, the residual, and the untouched original.
+#
+# The API layer reads this to order the comparison view's stem list. It deliberately
+# duplicates ``app.engine.pipeline.FULL_STEM_ORDER`` rather than importing it — the engine
+# module pulls in torch, which the API image does not install. Keep the two in sync when
+# adding a stem.
+STEM_ORDER: tuple[str, ...] = (
+    "vocals",
+    "drums",
+    "kick",
+    "snare",
+    "hihats",
+    "bass",
+    "guitar",
+    "piano",
+    "other",
+    "original",
 )
+
+# All possible stem names produced by the engine (allow-list, not a required set — the
+# content gate means a track yields only the stems it actually contains).
+STEM_NAMES = frozenset(STEM_ORDER)
 
 
 class OutputFile(Base, TimestampMixin):

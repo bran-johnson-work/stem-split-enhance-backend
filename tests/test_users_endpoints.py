@@ -126,3 +126,72 @@ async def test_protected_route_without_auth_returns_401(client):
     # No get_current_user override here → real dependency rejects the missing token.
     resp = await client.get("/api/v1/users/me")
     assert resp.status_code == 401
+
+
+# --- Avatars ----------------------------------------------------------------
+
+
+async def test_avatar_upload_url_success(auth_client, monkeypatch):
+    signed = {
+        "storage_key": "user-id/avatar",
+        "url": "https://up.example",
+        "fields": {"key": "user-id/avatar", "Content-Type": "image/png"},
+    }
+    monkeypatch.setattr(
+        users_module.user_service,
+        "create_avatar_upload_url",
+        AsyncMock(return_value=signed),
+    )
+    resp = await auth_client.post(
+        "/api/v1/users/me/avatar/upload-url", json={"content_type": "image/png"}
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["storage_key"] == "user-id/avatar"
+    assert body["fields"]["Content-Type"] == "image/png"
+
+
+async def test_avatar_upload_url_rejects_bad_type(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        users_module.user_service,
+        "create_avatar_upload_url",
+        AsyncMock(side_effect=ValueError("Unsupported image content type: application/zip")),
+    )
+    resp = await auth_client.post(
+        "/api/v1/users/me/avatar/upload-url", json={"content_type": "application/zip"}
+    )
+    assert resp.status_code == 400
+
+
+async def test_avatar_complete_success(auth_client, monkeypatch, sample_user):
+    monkeypatch.setattr(
+        users_module.user_service, "complete_avatar_upload", AsyncMock(return_value=sample_user)
+    )
+    resp = await auth_client.post("/api/v1/users/me/avatar/complete")
+    assert resp.status_code == 200
+    assert resp.json()["email"] == sample_user.email
+
+
+async def test_avatar_complete_no_file_returns_400(auth_client, monkeypatch):
+    monkeypatch.setattr(
+        users_module.user_service,
+        "complete_avatar_upload",
+        AsyncMock(side_effect=ValueError("No uploaded avatar found")),
+    )
+    resp = await auth_client.post("/api/v1/users/me/avatar/complete")
+    assert resp.status_code == 400
+
+
+async def test_avatar_delete_success(auth_client, monkeypatch, sample_user):
+    monkeypatch.setattr(
+        users_module.user_service, "remove_avatar", AsyncMock(return_value=sample_user)
+    )
+    resp = await auth_client.delete("/api/v1/users/me/avatar")
+    assert resp.status_code == 200
+
+
+async def test_avatar_endpoints_require_auth(client):
+    resp = await client.post(
+        "/api/v1/users/me/avatar/upload-url", json={"content_type": "image/png"}
+    )
+    assert resp.status_code == 401

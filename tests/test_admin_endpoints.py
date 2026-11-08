@@ -9,7 +9,18 @@ from app.api.v1.endpoints import admin as admin_module
 from app.main import app
 from app.models.output_file import OutputFile
 from app.models.project import Project, ProjectStatus
-from app.schemas.admin import AdminProjectResponse
+from app.schemas.admin import (
+    AdminOverviewResponse,
+    AdminProjectResponse,
+    AdminRevenueResponse,
+    AdminTrendPoint,
+    AdminTrendResponse,
+    JobStats,
+    PlanRevenue,
+    ProjectStats,
+    SubscriptionStats,
+    UserStats,
+)
 from app.services.admin_service import AdminService
 
 
@@ -112,6 +123,69 @@ async def test_admin_project_not_found_returns_404(admin_client, monkeypatch):
     )
     resp = await admin_client.get(f"/api/v1/admin/projects/{uuid.uuid4()}")
     assert resp.status_code == 404
+
+
+# --- stats endpoints ------------------------------------------------------
+
+
+async def test_admin_reads_overview(admin_client, monkeypatch):
+    overview = AdminOverviewResponse(
+        users=UserStats(total=10, active=8, verified=6, admins=1),
+        projects=ProjectStats(total=5, by_status={"completed": 5}),
+        jobs=JobStats(total=5, by_status={"completed": 5}),
+        subscriptions=SubscriptionStats(total=3, active=2, by_status={"active": 2}),
+    )
+    monkeypatch.setattr(
+        admin_module.admin_service, "overview", AsyncMock(return_value=overview)
+    )
+    resp = await admin_client.get("/api/v1/admin/stats/overview")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["users"]["total"] == 10
+    assert body["subscriptions"]["active"] == 2
+
+
+async def test_admin_reads_revenue(admin_client, monkeypatch):
+    revenue = AdminRevenueResponse(
+        mrr_cents=2750,
+        arr_cents=33000,
+        active_paid_subscriptions=2,
+        currency="usd",
+        by_plan=[PlanRevenue(plan_name="pro", display_name="Pro",
+                             active_subscriptions=2, mrr_cents=2750)],
+    )
+    monkeypatch.setattr(
+        admin_module.admin_service, "revenue", AsyncMock(return_value=revenue)
+    )
+    resp = await admin_client.get("/api/v1/admin/stats/revenue")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mrr_cents"] == 2750
+    assert body["by_plan"][0]["plan_name"] == "pro"
+
+
+async def test_admin_reads_trends_with_days_param(admin_client, monkeypatch):
+    trends = AdminTrendResponse(
+        points=[AdminTrendPoint(date="2026-07-28", signups=3, projects_created=1)]
+    )
+    spy = AsyncMock(return_value=trends)
+    monkeypatch.setattr(admin_module.admin_service, "trends", spy)
+    resp = await admin_client.get("/api/v1/admin/stats/trends?days=7")
+    assert resp.status_code == 200
+    assert resp.json()["points"][0]["signups"] == 3
+    # The query param is forwarded to the service.
+    assert spy.await_args.kwargs["days"] == 7
+
+
+async def test_trends_rejects_out_of_range_days(admin_client):
+    resp = await admin_client.get("/api/v1/admin/stats/trends?days=0")
+    assert resp.status_code == 422
+
+
+async def test_user_cannot_read_stats(user_client):
+    # The router-level ADMIN guard covers the new stats routes too.
+    resp = await user_client.get("/api/v1/admin/stats/overview")
+    assert resp.status_code == 403
 
 
 # --- service output-availability derivation -------------------------------

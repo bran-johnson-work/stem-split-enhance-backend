@@ -80,11 +80,14 @@ async def _request(method: str, path: str, data: dict[str, Any] | None = None) -
         "Authorization": f"Bearer {settings.stripe_secret_key}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
+    # Stripe reads list/read filters from the query string on GET, and form body
+    # on write verbs. Flattened either way (Stripe uses the same bracketed form
+    # for nested query params, e.g. ``created[gte]``).
+    flat = _flatten(data or {})
+    request_kwargs: dict[str, Any] = {"params": flat} if method == "GET" else {"data": flat}
     try:
         async with httpx.AsyncClient(timeout=settings.stripe_timeout_seconds) as client:
-            response = await client.request(
-                method, url, data=_flatten(data or {}), headers=headers
-            )
+            response = await client.request(method, url, headers=headers, **request_kwargs)
     except httpx.HTTPError as exc:  # transport error (DNS, timeout, connection)
         logger.error("Stripe transport error on %s: %s", path, exc)
         raise StripeError(f"Stripe transport error: {exc}") from exc
@@ -98,6 +101,10 @@ async def _request(method: str, path: str, data: dict[str, Any] | None = None) -
 
 async def _post(path: str, data: dict[str, Any]) -> dict[str, Any]:
     return await _request("POST", path, data)
+
+
+async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return await _request("GET", path, params)
 
 
 async def create_customer(*, email: str, user_id: str) -> dict[str, Any]:
@@ -129,6 +136,33 @@ async def create_price(
             "metadata": metadata or {},
         },
     )
+
+
+async def list_products(*, limit: int = 100, active: bool = True) -> list[dict[str, Any]]:
+    """List products (default: active only). Used to find an existing plan product."""
+    resp = await _get("products", {"limit": limit, "active": active})
+    data = resp.get("data")
+    return data if isinstance(data, list) else []
+
+
+async def list_prices(*, limit: int = 100, active: bool = True) -> list[dict[str, Any]]:
+    """List prices (default: active only), each carrying its ``recurring.interval``."""
+    resp = await _get("prices", {"limit": limit, "active": active})
+    data = resp.get("data")
+    return data if isinstance(data, list) else []
+
+
+async def archive_product(*, product_id: str) -> dict[str, Any]:
+    """Deactivate (archive) a product. Reversible — sets ``active=false``."""
+    return await _post(f"products/{product_id}", {"active": False})
+
+
+async def archive_price(*, price_id: str) -> dict[str, Any]:
+    """Deactivate (archive) a price. Prices can't be deleted, only deactivated.
+
+    Existing subscriptions on the price keep billing; it just can't back new ones.
+    """
+    return await _post(f"prices/{price_id}", {"active": False})
 
 
 async def create_checkout_session(
@@ -167,6 +201,35 @@ async def create_portal_session(*, customer_id: str, return_url: str) -> dict[st
     )
 
 
+async def retrieve_subscription(*, subscription_id: str) -> dict[str, Any]:
+    """Fetch a subscription object (used to read its current item id before a swap)."""
+    return await _get(f"subscriptions/{subscription_id}")
+
+
+async def update_subscription_price(
+    *,
+    subscription_id: str,
+    item_id: str,
+    price_id: str,
+    proration_behavior: str = "create_prorations",
+) -> dict[str, Any]:
+    """Swap the price on an existing subscription's line item (a plan change).
+
+    Replaces the single item's price rather than adding a second one, so the
+    subscription keeps billing one plan. ``proration_behavior`` controls the
+    money: ``always_invoice`` charges the prorated difference now (upgrades),
+    ``create_prorations`` books a credit toward the next invoice (downgrades).
+    Returns the updated subscription object, reused by the webhook sync path.
+    """
+    return await _post(
+        f"subscriptions/{subscription_id}",
+        {
+            "items": [{"id": item_id, "price": price_id}],
+            "proration_behavior": proration_behavior,
+        },
+    )
+
+
 async def cancel_subscription_at_period_end(*, subscription_id: str) -> dict[str, Any]:
     """Schedule a subscription to cancel at the end of the paid period.
 
@@ -185,6 +248,18 @@ async def resume_subscription(*, subscription_id: str) -> dict[str, Any]:
 async def cancel_subscription_now(*, subscription_id: str) -> dict[str, Any]:
     """Cancel a subscription immediately (DELETE); access ends at once."""
     return await _request("DELETE", f"subscriptions/{subscription_id}")
+
+
+async def list_invoices(*, customer_id: str, limit: int = 24) -> list[dict[str, Any]]:
+    """List a customer's invoices, newest first (Stripe's default order).
+
+    Stripe is the system of record for invoices — it renders and hosts the PDF —
+    so the app reads them on demand rather than keeping its own copies. Returns
+    the raw ``data`` array; ``billing_service`` maps it to the API DTO.
+    """
+    response = await _get("invoices", {"customer": customer_id, "limit": limit})
+    data = response.get("data")
+    return data if isinstance(data, list) else []
 
 
 def construct_event(

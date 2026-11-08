@@ -39,7 +39,16 @@ class Plan(Base, TimestampMixin):
     price_monthly_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # Annual price for the whole year (not per-month). 0 for the free plan.
     price_annual_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Legacy per-month *project* cap. No longer enforced — the metered unit is
+    # now audio files per month (see ``max_files_per_month``); projects are
+    # unlimited. Kept for backwards compatibility / display. None = unlimited.
     max_projects_per_month: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # None = unlimited
+    # The metered unit: how many input audio files a user may upload per billing
+    # period across all their projects. None = unlimited. Enforced in
+    # ``ProjectService._enforce_file_quota``.
+    max_files_per_month: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )  # None = unlimited
     max_file_size_mb: Mapped[int] = mapped_column(Integer, default=30, nullable=False)

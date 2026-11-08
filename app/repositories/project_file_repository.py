@@ -1,9 +1,11 @@
 import uuid
+from datetime import datetime
 from typing import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.project import Project
 from app.models.project_file import ProjectFile
 from app.repositories.base_repository import BaseRepository
 from app.schemas.project import ProjectCreate, ProjectUpdate
@@ -11,6 +13,25 @@ from app.schemas.project import ProjectCreate, ProjectUpdate
 
 class ProjectFileRepository(BaseRepository[ProjectFile, ProjectCreate, ProjectUpdate]):
     """Data access for the audio files uploaded to a project (one-to-many)."""
+
+    async def count_for_user_since(
+        self, db: AsyncSession, user_id: uuid.UUID, since: datetime
+    ) -> int:
+        """Count a user's uploaded input files created at/after ``since``.
+
+        Joins ``project_files`` to ``projects`` to scope by owner; this is the
+        monthly-quota counter (the metered unit is audio files, not projects).
+        Backed by the ``project_files.project_id`` index and the projects owner
+        index. A file's ``created_at`` is set when it is recorded at
+        upload-complete, so this counts genuinely-uploaded files only.
+        """
+        result = await db.execute(
+            select(func.count())
+            .select_from(ProjectFile)
+            .join(Project, ProjectFile.project_id == Project.id)
+            .where(Project.user_id == user_id, ProjectFile.created_at >= since)
+        )
+        return int(result.scalar_one() or 0)
 
     async def get_for_project(
         self, db: AsyncSession, *, project_id: uuid.UUID, file_id: uuid.UUID

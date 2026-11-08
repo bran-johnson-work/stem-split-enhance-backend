@@ -23,6 +23,7 @@ from app.repositories.plan_repository import plan_repository
 from app.repositories.subscription_repository import subscription_repository
 from app.schemas.billing import (
     BillingEventCreate,
+    InvoiceResponse,
     PlanResponse,
     SubscriptionCreate,
     SubscriptionResponse,
@@ -77,6 +78,118 @@ def _first_price_id(subscription_obj: dict[str, Any]) -> str | None:
         return None
 
 
+def _first_item(subscription_obj: dict[str, Any]) -> dict[str, Any] | None:
+    """The subscription's first line item (``{id, price, ...}``), or None."""
+    try:
+        item = subscription_obj["items"]["data"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return item if isinstance(item, dict) else None
+
+
+def _first_period(subscription_obj: dict[str, Any]) -> tuple[Any, Any]:
+    """The current billing period ``(start, end)`` as raw Stripe timestamps.
+
+    Newer Stripe API versions report ``current_period_start`` / ``current_period_end``
+    on the subscription **item**, not the subscription object; older versions put
+    them at the top level. Read the item first and fall back, so the renewal date
+    is captured on every version — otherwise an annual sub (item period a year out)
+    stores a null period end and the app can't show when it renews.
+    """
+    item = _first_item(subscription_obj) or {}
+    start = item.get("current_period_start") or subscription_obj.get("current_period_start")
+    end = item.get("current_period_end") or subscription_obj.get("current_period_end")
+    return start, end
+
+
+# Months in a year — used to annualise a monthly price so a monthly plan and an
+# annual plan can be compared on the same footing (upgrade vs downgrade).
+_MONTHS_PER_YEAR = 12
+
+
+def _annualised_cents(plan: Plan, interval: str) -> int:
+    """A plan's yearly cost for the given cadence, so plans on different cadences
+    (monthly vs annual) compare like-for-like when classifying a change."""
+    if interval == "annual":
+        return plan.price_annual_cents
+    return plan.price_monthly_cents * _MONTHS_PER_YEAR
+
+
+# Stripe's price.recurring.interval -> our stored cadence. Only month/year are
+# offered; anything else (or a missing recurring block) leaves it unknown.
+_INTERVAL_MAP = {"month": "monthly", "year": "annual"}
+
+
+def _first_interval(subscription_obj: dict[str, Any]) -> str | None:
+    """The billing cadence ("monthly"/"annual") from a Stripe subscription object.
+
+    Read off the first item's price recurring interval, which the subscription
+    row doesn't otherwise persist. Returns ``None`` when it can't be determined
+    so an existing value isn't clobbered with a guess.
+    """
+    try:
+        interval = subscription_obj["items"]["data"][0]["price"]["recurring"]["interval"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return _INTERVAL_MAP.get(interval)
+
+
+# Stripe invoice.status -> the three states the UI renders. Anything unpayable
+# (voided, written off) reads as a failed charge; a draft hasn't been issued yet
+# but is filtered out before this map is reached.
+_INVOICE_STATUS_MAP = {
+    "paid": "paid",
+    "open": "open",
+    "draft": "open",
+    "uncollectible": "failed",
+    "void": "failed",
+}
+
+
+def _map_invoice_status(stripe_status: str | None) -> str:
+    return _INVOICE_STATUS_MAP.get(stripe_status or "", "open")
+
+
+def _invoice_description(inv: dict[str, Any]) -> str | None:
+    """A human label for the invoice.
+
+    Stripe rarely fills the top-level ``description`` on a subscription invoice,
+    so fall back to the first line item's — which reads like "Pro — monthly" when
+    the price carries a nickname. Never fabricated: the client shows
+    "Subscription" when this is null.
+    """
+    if inv.get("description"):
+        return inv["description"]
+    lines = (inv.get("lines") or {}).get("data") or []
+    if lines and lines[0].get("description"):
+        return lines[0]["description"]
+    return None
+
+
+def _is_listable_invoice(inv: dict[str, Any]) -> bool:
+    """Hide drafts — they aren't finalised, carry no stable amount, and would
+    confuse a receipts list."""
+    return inv.get("status") != "draft"
+
+
+def _map_invoice(inv: dict[str, Any]) -> "InvoiceResponse":
+    # Stripe amounts are in the currency's minor unit (cents); the API speaks
+    # dollars, matching how plan prices are surfaced. ``total`` is the invoice's
+    # definitive amount (``amount_paid`` is 0 on an unpaid one).
+    total_cents = inv.get("total")
+    amount = (total_cents or 0) / 100
+    return InvoiceResponse(
+        id=str(inv["id"]),
+        created_at=datetime.fromtimestamp(int(inv.get("created", 0)), tz=timezone.utc),
+        amount=amount,
+        currency=str(inv.get("currency", "usd")).upper(),
+        status=_map_invoice_status(inv.get("status")),
+        description=_invoice_description(inv),
+        hosted_invoice_url=inv.get("hosted_invoice_url"),
+        invoice_pdf=inv.get("invoice_pdf"),
+    )
+
+
 def _extract_user_id(obj: dict[str, Any]) -> uuid.UUID | None:
     """Pull our user id from a Stripe object's metadata / client_reference_id."""
     raw = (obj.get("metadata") or {}).get("user_id") or obj.get("client_reference_id")
@@ -115,6 +228,7 @@ class BillingService:
                 has_subscription=True,
                 status=subscription.status,
                 plan=PlanResponse.model_validate(subscription.plan),
+                interval=subscription.billing_interval,
                 current_period_start=subscription.current_period_start,
                 current_period_end=subscription.current_period_end,
                 cancel_at_period_end=subscription.cancel_at_period_end,
@@ -134,6 +248,28 @@ class BillingService:
             cancel_at_period_end=False,
             cancelled_at=None,
         )
+
+    async def list_invoices(
+        self, db: AsyncSession, user_id: uuid.UUID
+    ) -> list[InvoiceResponse]:
+        """The caller's invoices, read live from Stripe (newest first).
+
+        Returns ``[]`` rather than erroring for anyone without a billing account
+        — a free user, or one who never completed checkout, simply has no
+        receipts. Only a genuine Stripe transport failure propagates.
+        """
+        settings = get_settings()
+        if not settings.billing_enabled:
+            return []
+
+        subscription = await subscription_repository.get_for_user(db, user_id)
+        if subscription is None or not subscription.stripe_customer_id:
+            return []
+
+        raw_invoices = await stripe.list_invoices(
+            customer_id=subscription.stripe_customer_id
+        )
+        return [_map_invoice(inv) for inv in raw_invoices if _is_listable_invoice(inv)]
 
     # --- Checkout / Portal ------------------------------------------------
 
@@ -187,6 +323,69 @@ class BillingService:
         )
         return session["url"]
 
+    async def change_plan(
+        self, db: AsyncSession, *, user: User, plan_name: str, interval: str
+    ) -> SubscriptionResponse | None:
+        """Switch an existing subscription to a different plan/cadence, in place.
+
+        Swaps the price on the live Stripe subscription (never a second one) and
+        prorates: an upgrade is invoiced now, a downgrade books a credit toward
+        the next invoice. Reuses the webhook sync path so the follow-up
+        ``customer.subscription.updated`` is an idempotent no-op. A no-op change
+        (already on this exact price) returns the current view without calling
+        Stripe. Moving *to* the free plan isn't a price swap — cancel instead.
+        """
+        settings = get_settings()
+        if not settings.billing_enabled:
+            raise BillingDisabledError("Billing is not configured.")
+
+        plan = await plan_repository.get_by_name(db, plan_name)
+        if plan is None or not plan.is_active:
+            raise PlanNotFoundError(f"Unknown plan '{plan_name}'.")
+        if plan.price_monthly_cents == 0 and plan.price_annual_cents == 0:
+            raise BillingRequestError(
+                "Cancel your subscription to move to the free plan."
+            )
+
+        price_id = (
+            plan.stripe_price_id_annual if interval == "annual" else plan.stripe_price_id_monthly
+        )
+        if not price_id:
+            raise BillingRequestError(
+                f"Plan '{plan_name}' is not available for {interval} billing yet."
+            )
+
+        subscription = await subscription_repository.get_for_user(db, user.id)
+        if subscription is None or not subscription.stripe_subscription_id:
+            raise BillingRequestError("No active subscription to change.")
+
+        stripe_sub = await stripe.retrieve_subscription(
+            subscription_id=subscription.stripe_subscription_id
+        )
+        current_item = _first_item(stripe_sub)
+        if current_item is None or "id" not in current_item:
+            raise BillingRequestError("This subscription has no plan to change.")
+
+        # Already on the requested price/cadence — nothing to do, and Stripe would
+        # reject a swap to the same price. Report the current state.
+        if (current_item.get("price") or {}).get("id") == price_id:
+            return await self.get_subscription_view(db, user.id)
+
+        # Upgrades are billed now; downgrades book a credit for the next invoice.
+        new_cost = _annualised_cents(plan, interval)
+        old_cost = _annualised_cents(subscription.plan, subscription.billing_interval or "monthly")
+        proration = "always_invoice" if new_cost >= old_cost else "create_prorations"
+
+        obj = await stripe.update_subscription_price(
+            subscription_id=subscription.stripe_subscription_id,
+            item_id=current_item["id"],
+            price_id=price_id,
+            proration_behavior=proration,
+        )
+        await self._on_subscription_upsert(db, obj)
+        await db.commit()
+        return await self.get_subscription_view(db, user.id)
+
     async def cancel_subscription(
         self, db: AsyncSession, *, user: User, immediate: bool = False
     ) -> SubscriptionResponse | None:
@@ -214,6 +413,33 @@ class BillingService:
                 subscription_id=subscription.stripe_subscription_id
             )
 
+        await self._on_subscription_upsert(db, obj)
+        await db.commit()
+        return await self.get_subscription_view(db, user.id)
+
+    async def resume_subscription(
+        self, db: AsyncSession, *, user: User
+    ) -> SubscriptionResponse | None:
+        """Undo a scheduled cancellation (clear ``cancel_at_period_end``).
+
+        The mirror of :meth:`cancel_subscription`: only valid while the sub is
+        still live but set to lapse at period end. Reuses the webhook sync path,
+        so the follow-up ``customer.subscription.updated`` is an idempotent no-op.
+        Raises :class:`BillingRequestError` when there's nothing to resume.
+        """
+        settings = get_settings()
+        if not settings.billing_enabled:
+            raise BillingDisabledError("Billing is not configured.")
+
+        subscription = await subscription_repository.get_for_user(db, user.id)
+        if subscription is None or not subscription.stripe_subscription_id:
+            raise BillingRequestError("No subscription to resume.")
+        if not subscription.cancel_at_period_end:
+            raise BillingRequestError("This subscription isn't scheduled to cancel.")
+
+        obj = await stripe.resume_subscription(
+            subscription_id=subscription.stripe_subscription_id
+        )
         await self._on_subscription_upsert(db, obj)
         await db.commit()
         return await self.get_subscription_view(db, user.id)
@@ -338,11 +564,12 @@ class BillingService:
         price_id = _first_price_id(sub_obj)
         plan = await plan_repository.get_by_stripe_price_id(db, price_id) if price_id else None
 
+        period_start, period_end = _first_period(sub_obj)
         fields: dict[str, Any] = {
             "status": _map_status(sub_obj.get("status")),
             "stripe_subscription_id": sub_obj.get("id"),
-            "current_period_start": _ts(sub_obj.get("current_period_start")),
-            "current_period_end": _ts(sub_obj.get("current_period_end")),
+            "current_period_start": _ts(period_start),
+            "current_period_end": _ts(period_end),
             "cancel_at_period_end": bool(sub_obj.get("cancel_at_period_end")),
             "cancelled_at": _ts(sub_obj.get("canceled_at")),
         }
@@ -350,6 +577,11 @@ class BillingService:
             fields["stripe_customer_id"] = sub_obj["customer"]
         if plan is not None:
             fields["plan_id"] = plan.id
+        # Only overwrite the cadence when we could actually read it, so a later
+        # event that omits the price detail doesn't wipe a known value.
+        interval = _first_interval(sub_obj)
+        if interval is not None:
+            fields["billing_interval"] = interval
 
         existing = await self._resolve_subscription(db, sub_obj)
         if existing is not None:

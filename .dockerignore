@@ -1,0 +1,49 @@
+# Keep the build context tiny — faster uploads, better cache hits, no secrets in
+# the image. Applies to every docker build (Dockerfile.api and Dockerfile.worker).
+
+# Version control / CI / editors
+.git
+.gitignore
+.github
+.idea
+.vscode
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments (never ship the host's venv into the image)
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets & env — must never be baked into an image
+.env
+.env.*
+!.env.example
+
+# Tests, docs and local-only assets — not needed at runtime
+tests/
+docs/
+*.md
+scripts/upload_tester.html
+
+# Local-only / gitignored dirs
+stem-engine/
+.agents/
+skills-lock.json
+
+# OS cruft
+.DS_Store
+Thumbs.db

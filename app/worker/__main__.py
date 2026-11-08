@@ -2,7 +2,8 @@
 
 Runs the separation worker until interrupted (SIGINT/SIGTERM), draining the
 Postgres-backed job queue. Deploy one or more of these on a CPU/GPU host alongside
-the API; they coordinate purely through Supabase Postgres + Storage.
+the API; they coordinate purely through AWS RDS Postgres + S3 object storage, using
+the same app.core.database engine and app.core.storage client the API does.
 """
 
 import asyncio

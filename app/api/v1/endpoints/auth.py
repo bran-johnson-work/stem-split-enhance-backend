@@ -10,9 +10,21 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import SlidingWindowRateLimiter
 from app.core.security import create_access_token
-from app.schemas.email import MessageResponse, VerificationRequest, VerifyEmailRequest
-from app.schemas.user import Token, UserCreate, UserResponse
-from app.services.auth_service import auth_service
+from app.schemas.email import (
+    ForgotPasswordRequest,
+    MessageResponse,
+    ResetPasswordRequest,
+    VerificationRequest,
+    VerifyEmailRequest,
+)
+from app.schemas.user import (
+    LogoutRequest,
+    RefreshRequest,
+    Token,
+    UserCreate,
+    UserResponse,
+)
+from app.services.auth_service import RefreshError, auth_service
 from app.services.email_service import email_service
 from app.services.user_service import user_service
 
@@ -122,22 +134,70 @@ async def login(
         )
 
     logger.info("Successful login user_id=%s", user.id)
+    refresh_token = await auth_service.issue_refresh_token(db, user.id)
+    await db.commit()
     return Token(
         access_token=create_access_token(data={"sub": str(user.id)}),
         token_type="bearer",
+        refresh_token=refresh_token,
+        expires_in=settings.access_token_expire_minutes * 60,
+    )
+
+
+@router.post("/refresh", response_model=Token)
+async def refresh(
+    body: RefreshRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Exchange a refresh token for a new access token.
+
+    This is what keeps a user signed in: the access token stays deliberately
+    short-lived, and the client trades this credential for a new one in the
+    background rather than making the user log in again every 30 minutes.
+
+    The refresh token is single-use — a new one comes back with each call, and
+    the presented one is retired. Clients must store the replacement.
+    """
+    try:
+        user, new_refresh_token = await auth_service.rotate_refresh_token(
+            db, body.refresh_token
+        )
+    except RefreshError as exc:
+        # Every failure mode collapses to one response: a client can only act on
+        # "log in again" regardless of which it was.
+        logger.info("Refresh rejected: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your session has expired. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return Token(
+        access_token=create_access_token(data={"sub": str(user.id)}),
+        token_type="bearer",
+        refresh_token=new_refresh_token,
+        expires_in=settings.access_token_expire_minutes * 60,
     )
 
 
 @router.post("/logout")
 async def logout(
+    body: LogoutRequest | None = None,
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
-    """Revoke the presented access token (logout)."""
+    """Revoke the presented access token, and the refresh token if one is sent.
+
+    Both matter: denylisting the access token alone would leave the refresh
+    token live, and the client could mint a new session straight after logging
+    out. The body is optional so an older client still logs out cleanly.
+    """
     jti = payload.get("jti")
     exp = payload.get("exp")
     if jti and exp:
         await auth_service.logout(db, jti=jti, exp_timestamp=int(exp))
+    if body and body.refresh_token:
+        await auth_service.revoke_refresh_token(db, body.refresh_token)
     return {"detail": "Successfully logged out"}
 
 
@@ -178,3 +238,48 @@ async def confirm_email_verification(
             detail="Invalid or expired verification token.",
         )
     return MessageResponse(detail="Email verified successfully.")
+
+
+@router.post("/forgot-password", response_model=MessageResponse)
+async def forgot_password(
+    request: Request,
+    body: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Send a password-reset link to the given address.
+
+    Always returns the same generic message so the endpoint can't be used to
+    probe which addresses have accounts. The email is only actually sent when a
+    matching, active user exists.
+    """
+    _enforce_signup_rate_limit(request)
+    user = await user_service.repository.get_by_email(db, body.email)
+    if user is not None and user.is_active:
+        background_tasks.add_task(email_service.send_password_reset_email, user)
+    else:
+        logger.info("Password reset requested for non-eligible email=%s", body.email)
+    return MessageResponse(
+        detail="If an account exists for that address, a password reset email has been sent."
+    )
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+async def reset_password(
+    body: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Set a new password using the token from the reset link.
+
+    On success every existing session is revoked, so the user (and anyone who may
+    have compromised the account) must log in again with the new password.
+    """
+    user = await email_service.reset_password(db, body.token, body.new_password)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+    return MessageResponse(
+        detail="Password reset successfully. Please log in with your new password."
+    )

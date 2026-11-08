@@ -26,7 +26,10 @@ class PlanResponse(BaseModel):
     display_name: str
     price_monthly_cents: int
     price_annual_cents: int
+    # Legacy project cap (no longer enforced; kept for display). None = unlimited.
     max_projects_per_month: int | None
+    # Audio files a user may upload per billing period. None = unlimited.
+    max_files_per_month: int | None = None
     max_file_size_mb: int
     features: dict | None
     is_active: bool
@@ -39,6 +42,18 @@ class CheckoutRequest(BaseModel):
 
     The client never sends a Stripe price id — the server resolves it from the
     plan row so a user cannot subscribe to a price they weren't offered.
+    """
+
+    plan_name: PlanName
+    interval: BillingInterval = BillingInterval.MONTHLY
+
+
+class ChangePlanRequest(BaseModel):
+    """Switch an existing subscription to ``plan_name`` on a billing ``interval``.
+
+    Unlike checkout this never creates a second subscription — it swaps the price
+    on the live one, prorated. The client sends only the plan/interval; the server
+    resolves the Stripe price so a user can't move to a price they weren't offered.
     """
 
     plan_name: PlanName
@@ -66,6 +81,9 @@ class SubscriptionResponse(BaseModel):
     has_subscription: bool
     status: SubscriptionStatus | None
     plan: PlanResponse
+    # Cadence the subscription is billed on. None for a free/unknown row; the
+    # frontend defaults such a case to monthly.
+    interval: BillingInterval | None = None
     current_period_start: datetime | None
     current_period_end: datetime | None
     # True => active but will not renew; ends at ``current_period_end``.
@@ -81,6 +99,27 @@ class CancelRequest(BaseModel):
     immediate: bool = False
 
 
+class InvoiceResponse(BaseModel):
+    """One billing receipt, sourced live from Stripe.
+
+    Amounts are **dollars** (Stripe reports cents; the service converts) so the
+    client formats them the same as every other price. The two URLs are Stripe's
+    own: ``hosted_invoice_url`` is a full receipt page, ``invoice_pdf`` a direct
+    PDF download — both short-lived, so they are fetched on demand, never stored.
+    """
+
+    id: str
+    # When the invoice was finalised, ISO-8601.
+    created_at: datetime
+    amount: float
+    currency: str
+    # Normalised to the set the UI renders: paid | open | failed.
+    status: str
+    description: str | None
+    hosted_invoice_url: str | None
+    invoice_pdf: str | None
+
+
 # --- Internal persistence schemas (feed BaseRepository create/update) ------
 
 
@@ -90,6 +129,7 @@ class SubscriptionCreate(BaseModel):
     status: SubscriptionStatus = SubscriptionStatus.INCOMPLETE
     stripe_customer_id: str | None = None
     stripe_subscription_id: str | None = None
+    billing_interval: str | None = None
     current_period_start: datetime | None = None
     current_period_end: datetime | None = None
     cancel_at_period_end: bool = False
@@ -101,6 +141,7 @@ class SubscriptionUpdate(BaseModel):
     status: SubscriptionStatus | None = None
     stripe_customer_id: str | None = None
     stripe_subscription_id: str | None = None
+    billing_interval: str | None = None
     current_period_start: datetime | None = None
     current_period_end: datetime | None = None
     cancel_at_period_end: bool | None = None

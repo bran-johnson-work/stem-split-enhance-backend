@@ -11,6 +11,7 @@ from app.models.base import Base, TimestampMixin, new_uuid
 if TYPE_CHECKING:
     from app.models.billing_event import BillingEvent
     from app.models.project import Project
+    from app.models.refresh_token import RefreshToken
     from app.models.subscription import Subscription
 
 
@@ -30,6 +31,10 @@ class User(Base, TimestampMixin):
     # matches), so no submitted password — empty or otherwise — can log in.
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # S3 object key of the user's profile avatar (in the avatars bucket), or NULL
+    # for none. Stored as a key, not a URL, so a fresh short-lived signed GET URL
+    # is generated per response (surfaced as ``UserResponse.avatar_url``).
+    avatar_key: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     role: Mapped[UserRole] = mapped_column(
@@ -44,4 +49,7 @@ class User(Base, TimestampMixin):
     )
     billing_events: Mapped[list["BillingEvent"]] = relationship(
         "BillingEvent", back_populates="user"
+    )
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )

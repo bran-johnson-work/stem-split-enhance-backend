@@ -1,0 +1,200 @@
+==============================================================================
+ KlearNote — AI Audio Stem Separation
+ CURRENT PRODUCTION FEATURES & DEMO GUIDE
+ (Plain-language walkthrough — no coding knowledge required)
+==============================================================================
+
+Last reviewed: 2026-07-28
+Scope: This document lists ONLY features that already exist and run in
+production today. Nothing here is planned, mocked-away, or local-only.
+
+
+------------------------------------------------------------------------------
+ WHAT IS KLEARNOTE?
+------------------------------------------------------------------------------
+KlearNote is an online service that takes a song (an audio file) and
+automatically splits it into separate "stems" — the individual parts of the
+track, like the vocals, drums, bass, guitar and piano — each as its own
+downloadable file. Musicians, producers, DJs and content creators use it to
+remix, practice, or make karaoke/instrumental versions.
+
+The product is a cloud service. A user signs up, uploads a song, the system
+processes it in the background, and the user downloads the separated parts.
+
+
+==============================================================================
+ PART 1 — FEATURES ALREADY LIVE IN PRODUCTION
+==============================================================================
+
+1. ACCOUNTS & SIGN-IN (Authentication)
+   - Create an account with email + password.
+   - Log in / log out securely.
+   - "Stay signed in" without re-typing the password — the app quietly renews
+     the session in the background, so users are not kicked out every 30 minutes.
+   - Protection against abuse: too many failed login attempts from the same
+     place are temporarily blocked. Sign-up and email requests are also
+     rate-limited to stop spam.
+   - Privacy by design: the login screen never reveals whether an email is
+     registered (it gives the same generic message either way).
+
+2. EMAIL SERVICE (Verification & Password Reset)
+   - After sign-up, the user automatically receives a branded KlearNote
+     "Confirm your email" message. They must verify before they can log in.
+   - Users can request the verification email again if they miss it.
+   - "Forgot password" sends a branded reset link (valid 1 hour). Setting a new
+     password automatically signs the account out everywhere for safety.
+   - All emails are professionally designed (KlearNote logo, colors) and render
+     correctly in Gmail, Outlook and Apple Mail.
+
+3. USER PROFILE
+   - View and update your own profile ("My account").
+   - Upload a profile picture (avatar); remove it later if desired.
+   - Delete your own account.
+   - Strict privacy: a user can only see and change their OWN account — never
+     anyone else's.
+
+4. PROJECTS & AUDIO UPLOAD
+   - Create a project (think of it as one workspace for a song).
+   - Upload an audio file directly and securely to cloud storage.
+   - Uploads are size-checked against the user's plan before they're allowed;
+     oversized files are rejected up front.
+   - List all your projects, open any one, re-download the original audio.
+   - Upload more than one file into a project, delete a single file, or delete
+     the whole project (which also cleans up all stored audio).
+
+5. AUTOMATIC STEM SEPARATION (the core feature)
+   - As soon as an upload finishes, the song is automatically queued for
+     processing — the user doesn't have to press anything extra.
+   - A background worker separates the track using AI.
+   - Users can watch progress (queued → processing → completed) and see the
+     status update live.
+   - Produces a full set of stems: VOCALS, DRUMS (plus kick / snare / hi-hats),
+     BASS, GUITAR, PIANO, and everything else ("other").
+
+6. DOWNLOAD RESULTS
+   - Once a song is done, the user gets secure, time-limited download links for
+     each separated stem.
+   - Links expire automatically for security.
+
+7. BILLING & SUBSCRIPTIONS (Stripe)
+   - Public pricing page listing the available plans (Free, and paid tiers).
+   - Subscribe/upgrade to a paid plan via Stripe Checkout (secure card entry
+     handled entirely by Stripe).
+   - See your current plan at any time.
+   - View your real invoices/receipts (pulled live from Stripe).
+   - Change plan in-app (switch tier or monthly/annual) with fair proration.
+   - Cancel (keep access until the period ends, or cancel immediately) and
+     "resume" a cancellation before it takes effect.
+   - Manage your saved card through the Stripe customer portal.
+   - Plans control real limits: how many files you may process per month and the
+     maximum file size you may upload.
+
+8. ADMIN DASHBOARD DATA (staff only)
+   - Admin-only, read-only reporting endpoints:
+       * List all users.
+       * Platform overview counts (users, projects, jobs, subscriptions).
+       * Revenue summary (monthly/annual recurring revenue, per-plan breakdown).
+       * Signup & project-creation trends over time.
+       * List/look up any project and its status.
+   - These are locked down so only ADMIN accounts can reach them.
+
+9. SECURITY & RELIABILITY (built in, invisible to users)
+   - Every request is authenticated; users only ever touch their own data.
+   - Logging out truly ends the session (it cannot be silently revived).
+   - Cloud audio storage; the app never stores raw card details (Stripe does).
+   - Health check endpoint so the hosting platform knows the app is alive.
+
+
+==============================================================================
+ PART 2 — DEMO SCENARIOS (step by step, for a live walkthrough)
+==============================================================================
+Each scenario is self-contained. Run them in order for the full story.
+No technical steps are needed — just use the app like a normal user.
+
+------------------------------------------------------------------------------
+ SCENARIO A — New user signs up and verifies their email
+------------------------------------------------------------------------------
+ 1. Open KlearNote and choose "Sign up".
+ 2. Enter a name, an email you can check, and a password. Submit.
+ 3. Show that the account is created and a confirmation email is sent.
+ 4. Open the inbox — point out the branded KlearNote "Confirm your email"
+    message. Click "Confirm my email".
+ 5. Show the "Email verified successfully" result.
+    ➜ Talking point: until this step, the account can't log in — this keeps
+      fake/typo emails out.
+
+------------------------------------------------------------------------------
+ SCENARIO B — Log in and view the profile
+------------------------------------------------------------------------------
+ 1. Go to "Log in", enter the email + password from Scenario A.
+ 2. You're taken into the app.
+ 3. Open "My account / Profile". Update the display name and save.
+ 4. (Optional) Upload a profile picture and show it appear.
+    ➜ Talking point: a user can only ever see/edit their own account.
+
+------------------------------------------------------------------------------
+ SCENARIO C — Upload a song and get the stems (the headline demo)
+------------------------------------------------------------------------------
+ 1. Click "New project" and give it a name (e.g. "Demo Song").
+ 2. Upload an audio file (an MP3/WAV of a song).
+ 3. Show the upload completing — processing starts automatically.
+ 4. Watch the status move from "Queued" → "Processing" → "Completed".
+    (Have a pre-processed song ready as a backup so the demo never stalls
+    waiting on the AI.)
+ 5. When complete, open the results and show the separate stems:
+    Vocals, Drums, Bass, Guitar, Piano, Other (plus kick/snare/hi-hats).
+ 6. Download the "Vocals" and the "Drums" stems and play a few seconds of each.
+    ➜ Talking point: one upload, fully automatic, clean isolated parts.
+
+------------------------------------------------------------------------------
+ SCENARIO D — Forgot password
+------------------------------------------------------------------------------
+ 1. Log out. On the login screen click "Forgot password".
+ 2. Enter the account email and submit.
+ 3. Open the inbox and click the branded "Reset my password" link.
+ 4. Choose a new password.
+ 5. Show that you can now log in with the NEW password (and the old one no
+    longer works).
+    ➜ Talking point: resetting the password signs the account out everywhere —
+      a security best practice.
+
+------------------------------------------------------------------------------
+ SCENARIO E — Subscribe to a paid plan (billing)
+------------------------------------------------------------------------------
+ 1. Open the "Pricing / Plans" page and show the available plans and prices.
+ 2. Choose a paid plan and continue to checkout.
+ 3. Complete payment on the secure Stripe Checkout page (use a Stripe test
+    card for the demo).
+ 4. Back in the app, show the plan is now active on the account.
+ 5. Open "Invoices / Billing" and show the real receipt.
+ 6. (Optional) Show "Change plan" (switch monthly↔annual or tier) and the
+    "Cancel / Resume" controls.
+    ➜ Talking point: real payments, real invoices, and users manage everything
+      in-app; the paid plan unlocks bigger files and more songs per month.
+
+------------------------------------------------------------------------------
+ SCENARIO F — Admin dashboard (staff view, optional)
+------------------------------------------------------------------------------
+ 1. Log in with an ADMIN account.
+ 2. Show the overview numbers (total users, projects, jobs, subscriptions).
+ 3. Show the revenue summary and the signups/projects trend.
+ 4. Show the full user list and look up the project created in Scenario C.
+    ➜ Talking point: leadership can see growth and revenue at a glance; these
+      views are locked to staff only.
+
+
+==============================================================================
+ PART 3 — QUICK "ELEVATOR" SUMMARY (one paragraph)
+==============================================================================
+KlearNote is live today as a complete self-serve product: users sign up and
+verify by email, log in securely (with forgot-password recovery), manage their
+profile and avatar, upload songs, and get them automatically split by AI into
+clean vocal/drum/bass/guitar/piano stems that they download. Paid subscriptions
+run on Stripe — checkout, invoices, in-app plan changes, cancel/resume — and
+plans enforce real usage limits. Staff get an admin dashboard for users,
+activity and revenue. Everything is protected so each user only ever touches
+their own data.
+
+==============================================================================
+ END
+==============================================================================

@@ -10,8 +10,10 @@ from app.core.stripe import SignatureVerificationError, StripeError
 from app.models.user import User
 from app.schemas.billing import (
     CancelRequest,
+    ChangePlanRequest,
     CheckoutRequest,
     CheckoutResponse,
+    InvoiceResponse,
     PlanResponse,
     PortalResponse,
     SubscriptionResponse,
@@ -45,6 +47,23 @@ async def get_my_subscription(
     subscription row, so the client always receives a plan to display.
     """
     return await billing_service.get_subscription_view(db, current_user.id)
+
+
+@router.get("/invoices", response_model=list[InvoiceResponse])
+async def list_invoices(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """The caller's invoices, read live from Stripe.
+
+    Empty for a free user or anyone who never completed checkout — that's a
+    normal state, not an error. Only a Stripe outage surfaces (502).
+    """
+    try:
+        return await billing_service.list_invoices(db, current_user.id)
+    except StripeError:
+        logger.exception("Stripe invoice listing failed for user %s", current_user.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
@@ -91,6 +110,37 @@ async def create_portal(
     return PortalResponse(portal_url=url)
 
 
+@router.post("/change-plan", response_model=SubscriptionResponse)
+async def change_plan(
+    payload: ChangePlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Switch an existing subscription to another plan/cadence, in place (prorated).
+
+    For a user who already has an active paid subscription — the in-app plan
+    picker calls this instead of opening the Stripe portal. New subscribers go
+    through ``/checkout``; moving to the free plan goes through ``/cancel``.
+    """
+    try:
+        subscription = await billing_service.change_plan(
+            db,
+            user=current_user,
+            plan_name=payload.plan_name.value,
+            interval=payload.interval.value,
+        )
+    except BillingDisabledError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Billing is not available.")
+    except PlanNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except BillingRequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    except StripeError:
+        logger.exception("Stripe plan change failed for user %s", current_user.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
+    return subscription
+
+
 @router.post("/cancel", response_model=SubscriptionResponse)
 async def cancel_subscription(
     payload: CancelRequest = CancelRequest(),
@@ -112,6 +162,24 @@ async def cancel_subscription(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     except StripeError:
         logger.exception("Stripe cancel failed for user %s", current_user.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
+    return subscription
+
+
+@router.post("/resume", response_model=SubscriptionResponse)
+async def resume_subscription(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """Undo a scheduled cancellation, keeping the subscription on to renew."""
+    try:
+        subscription = await billing_service.resume_subscription(db, user=current_user)
+    except BillingDisabledError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Billing is not available.")
+    except BillingRequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    except StripeError:
+        logger.exception("Stripe resume failed for user %s", current_user.id)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment provider error.")
     return subscription
 
