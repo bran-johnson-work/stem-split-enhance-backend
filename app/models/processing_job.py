@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, String, Text
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -40,6 +40,21 @@ class ProcessingJob(Base, TimestampMixin):
     engine_job_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # --- Worker lease / liveness (RCA-1: recover jobs stranded by a dead worker) ---
+    # Refreshed by the owning worker while it processes the job. A PROCESSING job
+    # whose heartbeat has gone stale is treated as abandoned and reclaimed by the
+    # reaper (see app/worker/reaper.py). Set at claim time and on every heartbeat.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Incremented on each claim. The reaper requeues an abandoned job while
+    # ``attempts < max_attempts`` and marks it FAILED once the cap is reached, so a
+    # job that reliably kills its worker (a "poison pill") can't loop forever.
+    attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
 
     project: Mapped["Project"] = relationship("Project", back_populates="processing_jobs")
     output_files: Mapped[list["OutputFile"]] = relationship(

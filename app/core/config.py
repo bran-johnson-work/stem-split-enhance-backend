@@ -40,9 +40,8 @@ class Settings(BaseSettings):
     signup_rate_limit_max_attempts: int = 10
     signup_rate_limit_window_seconds: int = 3600
 
-    # Audio uploads. 50 MB matches the Supabase Free-plan global upload ceiling;
-    # raise this (and the project's Storage limit) on a paid plan if needed.
-    max_upload_size_bytes: int = 50 * 1024 * 1024  # 50 MB
+
+    max_upload_size_bytes: int = 50 * 1024 * 1024  # 50 MB (Supabase Free ceiling)
     allowed_audio_content_types: str = (
         "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave,"
         "audio/flac,audio/x-flac,audio/mp4,audio/aac,audio/ogg,audio/webm"
@@ -64,6 +63,22 @@ class Settings(BaseSettings):
 
     require_email_verification: bool = True
 
+    # --- Billing (Stripe) ---
+    # ``stripe_secret_key`` empty => billing is disabled: checkout/portal return a
+    # clean 503 and the webhook 404s, so local dev and tests stay network-free.
+    stripe_secret_key: str = ""
+    # Publishable key is only consumed by the frontend; exposed via GET config if needed.
+    stripe_publishable_key: str = ""
+    # Signing secret from the Stripe CLI (`stripe listen`) or the dashboard webhook.
+    stripe_webhook_secret: str = ""
+    stripe_api_base_url: str = "https://api.stripe.com"
+    stripe_timeout_seconds: float = 15.0
+    # Where Stripe Checkout / the Customer Portal send the user back to. Empty =>
+    # fall back to ``frontend_url``.
+    billing_success_url: str = ""
+    billing_cancel_url: str = ""
+    billing_portal_return_url: str = ""
+
     # --- Stem-separation engine + worker ---
     # HT-Demucs fine-tuned bag (vocals / drums / bass / other).
     demucs_model: str = "htdemucs_ft"
@@ -75,8 +90,40 @@ class Settings(BaseSettings):
     enable_enhancement: bool = True
     # How often an idle worker polls the queue for the next PENDING job.
     worker_poll_interval_seconds: float = 5.0
+
+    # --- Progress-write debounce (RCA-3) ---
+    # How often the relay loop samples the engine's latest progress. Also caps how
+    # quickly a stage-boundary/label change reaches the DB.
+    worker_progress_poll_seconds: float = 2.0
+    # Persist a progress update when it jumps at least this many percentage points
+    # (below this, and with no label change, the write is skipped).
+    worker_progress_min_delta: float = 5.0
+    # ...or when at least this long has passed since the last write, so a long
+    # single stage still ticks over and never looks frozen to a watcher.
+    worker_progress_min_interval_seconds: float = 10.0
+
+    # --- Worker lease / stuck-job recovery (RCA-1) ---
+    # How often a busy worker refreshes its job's heartbeat while processing.
+    worker_heartbeat_interval_seconds: float = 15.0
+    # A PROCESSING job whose heartbeat is older than this is treated as abandoned
+    # (its worker died) and reclaimed by the reaper. Keep it comfortably larger
+    # than the heartbeat interval so a missed beat or two doesn't trigger a false
+    # reclaim of a job that's actually still running.
+    job_stale_timeout_seconds: float = 90.0
+    # How often each worker sweeps for abandoned jobs to reclaim.
+    reaper_interval_seconds: float = 30.0
+    # Run the reaper in-process on this worker. Safe to leave on for every worker
+    # (the sweep is atomic and locks rows SKIP LOCKED); set False on all but one
+    # if you'd rather a single worker own the sweep.
+    worker_run_reaper: bool = True
     # Scratch dir for a job's temp files; empty => the OS default temp dir.
     job_scratch_dir: str = ""
+    # When set, completed stems are written to this local directory instead of
+    # being uploaded to the Supabase stems bucket — a workaround for the Free
+    # plan's 50 MB object cap, which rejects large WAV stems with HTTP 413. The
+    # on-disk layout mirrors the bucket: <dir>/<user_id>/<project_id>/stems/<name>.wav.
+    # Empty => upload to Supabase Storage as usual.
+    stems_local_dir: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -105,6 +152,23 @@ class Settings(BaseSettings):
     def email_enabled(self) -> bool:
         """Whether outbound email is configured (a Resend API key is present)."""
         return bool(self.resend_api_key)
+
+    @property
+    def billing_enabled(self) -> bool:
+        """Whether Stripe billing is configured (a secret key is present)."""
+        return bool(self.stripe_secret_key)
+
+    @property
+    def checkout_success_url(self) -> str:
+        return self.billing_success_url or f"{self.frontend_url}/billing/success"
+
+    @property
+    def checkout_cancel_url(self) -> str:
+        return self.billing_cancel_url or f"{self.frontend_url}/billing"
+
+    @property
+    def portal_return_url(self) -> str:
+        return self.billing_portal_return_url or f"{self.frontend_url}/billing"
 
     @property
     def email_uses_sandbox_sender(self) -> bool:

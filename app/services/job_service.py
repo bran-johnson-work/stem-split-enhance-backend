@@ -7,11 +7,13 @@ onto the Postgres-backed queue and to read job/stem state back out for the clien
 
 import logging
 import uuid
+from pathlib import Path
 
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import storage
+from app.core.config import get_settings
 from app.models.processing_job import JobStatus, ProcessingJob
 from app.models.project import ProjectStatus
 from app.repositories.output_file_repository import output_file_repository
@@ -92,18 +94,26 @@ class JobService:
         if job is None:
             return None
 
+        local_dir = get_settings().stems_local_dir
         outputs = await self.output_repository.list_for_job(db, job_id)
         downloads: list[StemDownload] = []
         for out in outputs:
-            url = await run_in_threadpool(
-                storage.get_signed_url, storage.BUCKET_STEMS, out.storage_key, expires_in
-            )
+            if local_dir:
+                # Stems live on local disk (Supabase upload bypassed). Hand back a
+                # file:// URI to the file rather than a signed URL; it never expires.
+                url = (Path(local_dir) / out.storage_key).resolve().as_uri()
+                expires = 0
+            else:
+                url = await run_in_threadpool(
+                    storage.get_signed_url, storage.BUCKET_STEMS, out.storage_key, expires_in
+                )
+                expires = expires_in
             downloads.append(
                 StemDownload(
                     stem_name=out.stem_name,
                     is_enhanced=out.is_enhanced,
                     url=url,
-                    expires_in=expires_in,
+                    expires_in=expires,
                 )
             )
         return downloads

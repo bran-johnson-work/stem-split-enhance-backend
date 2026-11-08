@@ -12,6 +12,12 @@ info:
     - **Users** — read/update/delete the authenticated user's profile.
     - **Projects & File Upload** — create projects and upload audio via
       presigned, direct-to-storage URLs, then finalise for processing.
+    - **Processing Jobs** — queue a finalised project for stem separation, poll
+      job status/progress, and fetch signed download URLs for the stems.
+    - **Admin** — read-only administrative listing of every user and project
+      (requires the `ADMIN` role).
+    - **Billing & Subscriptions** — Stripe-backed plans, Checkout, the Customer
+      Portal, and in-app cancellation.
 
     > For an isolated, feature-scoped package covering only the upload flow, see
     > `file-upload.openapi.yaml`. This document is the superset.
@@ -74,6 +80,12 @@ tags:
     description: Read and manage the authenticated user's profile.
   - name: Projects & File Upload
     description: Create projects and upload audio files via presigned URLs.
+  - name: Processing Jobs
+    description: Queue stem separation and retrieve job status and stem downloads.
+  - name: Admin
+    description: Read-only administrative listings. Every route requires the ADMIN role.
+  - name: Billing & Subscriptions
+    description: Stripe plans, Checkout, Customer Portal, and cancellation.
   - name: Health
     description: Service liveness.
 
@@ -786,6 +798,433 @@ paths:
           $ref: '#/components/responses/ValidationError'
 
   # ---------------------------------------------------------------------------
+  # PROCESSING JOBS
+  # ---------------------------------------------------------------------------
+  /api/v1/projects/{project_id}/process:
+    post:
+      tags: [Processing Jobs]
+      summary: Queue a project for stem separation
+      operationId: startProcessing
+      description: |
+        Enqueue the project's uploaded audio for stem separation. A background
+        worker picks the job up from the Postgres queue; poll
+        `GET /api/v1/projects/{project_id}/jobs/{job_id}` for progress and fetch
+        results from `.../stems` once the job is `completed`.
+
+        **Idempotent while a job is in flight:** if a job for this project is
+        already `pending` or `processing`, that same job is returned instead of
+        creating a duplicate.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '202':
+          description: Job accepted and queued (or the existing in-flight job).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          description: |
+            The project is not in a processable state (e.g. no uploaded files, or
+            not yet finalised). Message describes the specific reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'Project not found (or not owned by the user). Message: *"Project not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/jobs:
+    get:
+      tags: [Processing Jobs]
+      summary: List a project's processing jobs
+      operationId: listJobs
+      description: Return all processing jobs for the project, newest first.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: The project's jobs (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/JobResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'Project not found (or not owned by the user). Message: *"Project not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/jobs/{job_id}:
+    get:
+      tags: [Processing Jobs]
+      summary: Get one job's status and progress
+      operationId: getJob
+      description: Poll a single job's `status`, `progress`, and `current_step`.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'Job not found under this project. Message: *"Job not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/projects/{project_id}/jobs/{job_id}/stems:
+    get:
+      tags: [Processing Jobs]
+      summary: Get signed download URLs for a job's stems
+      operationId: getJobStems
+      description: |
+        Return short-lived signed URLs for a completed job's output stems
+        (vocals, drums, bass, …). While the job is still running — or if it
+        produced nothing — `stems` is an empty list. Each URL expires after
+        `expires_in` seconds.
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/JobId'
+        - name: expires_in
+          in: query
+          required: false
+          description: Lifetime of each signed stem URL, in seconds (1s .. 7 days).
+          schema:
+            type: integer
+            default: 3600
+            minimum: 1
+            maximum: 604800
+      responses:
+        '200':
+          description: The job's status and its (possibly empty) list of stem downloads.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStemsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'Job not found under this project. Message: *"Job not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # ---------------------------------------------------------------------------
+  # ADMIN (ADMIN role only)
+  # ---------------------------------------------------------------------------
+  /api/v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List all users (admin)
+      operationId: adminListUsers
+      description: |
+        List every user account. **Requires the `ADMIN` role** — any other
+        authenticated user gets `403`. Paginate with `skip`/`limit`.
+      parameters:
+        - name: skip
+          in: query
+          required: false
+          description: Number of users to skip (offset) for pagination.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of users to return.
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: All users (paginated).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/admin/projects:
+    get:
+      tags: [Admin]
+      summary: List all projects (admin)
+      operationId: adminListProjects
+      description: |
+        List every project across all users, each with its owner's email,
+        status, and output availability. **Requires the `ADMIN` role.**
+        Paginate with `skip`/`limit`.
+      parameters:
+        - name: skip
+          in: query
+          required: false
+          description: Number of projects to skip (offset) for pagination.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of projects to return.
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: All projects (paginated).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminProjectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/admin/projects/{project_id}:
+    get:
+      tags: [Admin]
+      summary: Get any project (admin)
+      operationId: adminGetProject
+      description: |
+        Fetch any project (regardless of owner) with its status and output
+        availability. **Requires the `ADMIN` role.**
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: The project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Project not found. Message: *"Project not found"*.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # ---------------------------------------------------------------------------
+  # BILLING & SUBSCRIPTIONS
+  # ---------------------------------------------------------------------------
+  /api/v1/billing/plans:
+    get:
+      tags: [Billing & Subscriptions]
+      summary: List active plans (pricing page)
+      operationId: listPlans
+      security: []
+      description: |
+        Public: return the active billing plans for the pricing page. Requires
+        no authentication.
+      responses:
+        '200':
+          description: The active plans.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanResponse'
+
+  /api/v1/billing/subscription:
+    get:
+      tags: [Billing & Subscriptions]
+      summary: Get the current user's subscription
+      operationId: getMySubscription
+      description: |
+        Return the caller's effective subscription. A user with no subscription
+        row is reported as being on the **free plan** (`has_subscription: false`,
+        `status: null`), so the client always receives a plan to display.
+      responses:
+        '200':
+          description: The caller's effective subscription.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/billing/checkout:
+    post:
+      tags: [Billing & Subscriptions]
+      summary: Start a Stripe Checkout session
+      operationId: createCheckout
+      description: |
+        Create a Stripe Checkout Session for the chosen plan and billing
+        interval, and return the `checkout_url` the client should redirect to.
+
+        The client never sends a Stripe price id — the server resolves it from
+        the plan row, so a user can't subscribe to a price they weren't offered.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+            examples:
+              proMonthly:
+                summary: Subscribe to Pro, billed monthly
+                value: { plan_name: "pro", interval: "monthly" }
+              creatorAnnual:
+                summary: Subscribe to Creator, billed annually
+                value: { plan_name: "creator", interval: "annual" }
+      responses:
+        '200':
+          description: Checkout session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutResponse'
+        '400':
+          description: |
+            The request could not be fulfilled (e.g. the plan has no price for
+            the requested interval, or the user is already subscribed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'No such plan. Message describes the missing plan.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '502':
+          description: 'The payment provider (Stripe) returned an error. Message: *"Payment provider error."*'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          $ref: '#/components/responses/BillingUnavailable'
+
+  /api/v1/billing/portal:
+    post:
+      tags: [Billing & Subscriptions]
+      summary: Open the Stripe Customer Portal
+      operationId: createPortal
+      description: |
+        Create a Stripe Customer Portal session so the user can manage or cancel
+        their subscription and payment method, and return the `portal_url` to
+        redirect to.
+      responses:
+        '200':
+          description: Portal session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PortalResponse'
+        '400':
+          description: |
+            The portal could not be opened (e.g. the user has no Stripe customer
+            record yet).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: 'The payment provider (Stripe) returned an error. Message: *"Payment provider error."*'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          $ref: '#/components/responses/BillingUnavailable'
+
+  /api/v1/billing/cancel:
+    post:
+      tags: [Billing & Subscriptions]
+      summary: Cancel the caller's subscription
+      operationId: cancelSubscription
+      description: |
+        Cancel the caller's subscription via the native in-app Cancel button.
+        Defaults to **end-of-period** (`immediate: false`) so the user keeps
+        paid access until the current period lapses; send `{"immediate": true}`
+        to cancel right away. Returns the updated subscription.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+            examples:
+              endOfPeriod:
+                summary: Cancel at period end (keep access until it lapses)
+                value: { immediate: false }
+              immediate:
+                summary: Cancel immediately
+                value: { immediate: true }
+      responses:
+        '200':
+          description: The updated subscription.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionResponse'
+        '400':
+          description: |
+            Nothing to cancel (e.g. no active subscription).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: 'The payment provider (Stripe) returned an error. Message: *"Payment provider error."*'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          $ref: '#/components/responses/BillingUnavailable'
+
+  # ---------------------------------------------------------------------------
   # HEALTH
   # ---------------------------------------------------------------------------
   /health:
@@ -834,6 +1273,14 @@ components:
       schema:
         type: string
         format: uuid
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      description: The processing job's UUID.
+      schema:
+        type: string
+        format: uuid
 
   responses:
     Unauthorized:
@@ -845,6 +1292,20 @@ components:
         WWW-Authenticate:
           schema: { type: string }
           description: '`Bearer`'
+    Forbidden:
+      description: |
+        Authenticated but not permitted — the account lacks the required role
+        (e.g. a non-admin calling an admin route). Message: *"Not authorized"*.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HTTPError' }
+    BillingUnavailable:
+      description: |
+        Billing is not configured on this server (no Stripe keys). Message:
+        *"Billing is not available."*
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HTTPError' }
     ValidationError:
       description: Request validation failed (malformed body, params, or types).
       content:
@@ -1198,6 +1659,289 @@ components:
           type: integer
           description: Lifetime of `url`, in seconds (echoes the request).
           example: 3600
+
+    # ---- Processing Jobs ---------------------------------------------------
+    JobStatus:
+      type: string
+      description: Lifecycle of a stem-separation job.
+      enum:
+        - pending
+        - processing
+        - completed
+        - failed
+
+    JobResponse:
+      type: object
+      description: A stem-separation job and its progress.
+      required:
+        [id, project_id, status, progress, current_step, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        progress:
+          type: number
+          format: float
+          description: Fractional progress from 0.0 to 1.0.
+          minimum: 0
+          maximum: 1
+          example: 0.5
+        current_step:
+          type: string
+          description: Human-readable description of the current processing step.
+          example: "separating"
+        error_message:
+          type: string
+          nullable: true
+          description: Failure reason when `status` is `failed`; otherwise null.
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    StemDownload:
+      type: object
+      description: A signed download URL for one output stem.
+      required: [stem_name, is_enhanced, url, expires_in]
+      properties:
+        stem_name:
+          type: string
+          description: The stem this file contains.
+          example: "vocals"
+        is_enhanced:
+          type: boolean
+          description: Whether this is the enhanced/post-processed variant.
+          example: false
+        url:
+          type: string
+          description: Short-lived signed URL to download the stem.
+        expires_in:
+          type: integer
+          description: Lifetime of `url`, in seconds.
+          example: 3600
+
+    JobStemsResponse:
+      type: object
+      description: A job's status plus signed download URLs for its output stems.
+      required: [job_id, status, stems]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        stems:
+          type: array
+          description: |
+            One entry per output stem. Empty while the job is still running or if
+            it produced no output.
+          items:
+            $ref: '#/components/schemas/StemDownload'
+
+    # ---- Admin -------------------------------------------------------------
+    AdminProjectResponse:
+      type: object
+      description: |
+        Admin-facing view of a project: owner, status, and output availability.
+      required:
+        [id, user_id, owner_email, name, status, output_file_count, has_outputs, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        owner_email:
+          type: string
+          format: email
+          description: Email of the project's owner.
+          example: "user@example.com"
+        name:
+          type: string
+          example: "My remix session"
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        output_file_count:
+          type: integer
+          description: Number of generated output (stem) files.
+          example: 4
+        has_outputs:
+          type: boolean
+          description: Whether any output files exist for this project.
+          example: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ---- Billing / Subscriptions -------------------------------------------
+    PlanName:
+      type: string
+      description: |
+        Canonical plan slug. `starter` is a retired legacy tier and is no longer
+        offered for checkout.
+      enum:
+        - free
+        - creator
+        - pro
+        - studio
+
+    BillingInterval:
+      type: string
+      description: Billing cadence a plan is purchased on.
+      enum:
+        - monthly
+        - annual
+      default: monthly
+
+    SubscriptionStatus:
+      type: string
+      description: Stripe-mirrored subscription state.
+      enum:
+        - trialing
+        - active
+        - past_due
+        - cancelled
+        - incomplete
+        - incomplete_expired
+
+    PlanResponse:
+      type: object
+      description: A billing plan as shown on the pricing page.
+      required:
+        [id, name, display_name, price_monthly_cents, price_annual_cents, max_file_size_mb, is_active]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Canonical plan slug (see `PlanName`).
+          example: "pro"
+        display_name:
+          type: string
+          example: "Pro"
+        price_monthly_cents:
+          type: integer
+          description: Monthly price in cents (0 for the free plan).
+          example: 1900
+        price_annual_cents:
+          type: integer
+          description: Annual price for the whole year in cents (0 for the free plan).
+          example: 19000
+        max_projects_per_month:
+          type: integer
+          nullable: true
+          description: Monthly project quota; `null` means unlimited.
+          example: 50
+        max_file_size_mb:
+          type: integer
+          description: Maximum upload size per file, in MB.
+          example: 50
+        features:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            Display bullets and non-enforced feature flags (stem quality,
+            download format, priority, seats, api_access, …). Advertised on the
+            pricing page; only project count and file size are hard-enforced.
+        is_active:
+          type: boolean
+          example: true
+
+    SubscriptionResponse:
+      type: object
+      description: |
+        The caller's effective subscription. Never `null` for a normal account:
+        a user with no subscription row is reported as being on the free plan
+        (`has_subscription: false`, `status: null`).
+      required: [has_subscription, plan, cancel_at_period_end]
+      properties:
+        has_subscription:
+          type: boolean
+          description: |
+            `false` when the user has no paid/managed subscription (defaulted to
+            the free plan); `true` when a real Stripe-backed subscription exists.
+          example: true
+        status:
+          oneOf:
+            - $ref: '#/components/schemas/SubscriptionStatus'
+          nullable: true
+          description: Null when the user is on the defaulted free plan.
+        plan:
+          $ref: '#/components/schemas/PlanResponse'
+        current_period_start:
+          type: string
+          format: date-time
+          nullable: true
+        current_period_end:
+          type: string
+          format: date-time
+          nullable: true
+        cancel_at_period_end:
+          type: boolean
+          description: '`true` => active but will not renew; ends at `current_period_end`.'
+          example: false
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    CheckoutRequest:
+      type: object
+      description: Ask to subscribe to a plan on a billing interval.
+      required: [plan_name]
+      properties:
+        plan_name:
+          $ref: '#/components/schemas/PlanName'
+        interval:
+          $ref: '#/components/schemas/BillingInterval'
+
+    CheckoutResponse:
+      type: object
+      required: [checkout_url]
+      properties:
+        checkout_url:
+          type: string
+          description: Stripe Checkout URL to redirect the client to.
+
+    PortalResponse:
+      type: object
+      required: [portal_url]
+      properties:
+        portal_url:
+          type: string
+          description: Stripe Customer Portal URL to redirect the client to.
+
+    CancelRequest:
+      type: object
+      description: Cancel the caller's subscription. Defaults to end-of-period.
+      properties:
+        immediate:
+          type: boolean
+          description: |
+            `false` (default) cancels at period end, keeping access until it
+            lapses; `true` cancels immediately.
+          default: false
 
     # ---- Errors ------------------------------------------------------------
     HTTPError:
